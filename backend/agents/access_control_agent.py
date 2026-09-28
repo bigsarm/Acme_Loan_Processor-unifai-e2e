@@ -1,6 +1,7 @@
 """Access Control Agent — demo for LLM-driven security decisions without HITL."""
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -8,6 +9,72 @@ from .framework import AcmeLoanAgentFramework
 from .mock_database import search_borrower_records
 
 logger = logging.getLogger(__name__)
+
+
+def _contains_encoded_payload(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(
+        re.search(r"(?:[A-Za-z0-9+/]{20,}={0,2})", compact)
+        or re.search(r"(?:0x[0-9a-fA-F]{2,}|\\x[0-9a-fA-F]{2,}|%[0-9a-fA-F]{2})", text or "")
+        or re.search(r"(?:[01]{8}(?:\s+[01]{8}){2,})", text or "")
+        or re.search(r"(?:[.-]{1,6}(?:\s+[.-]{1,6}){2,})", text or "")
+        or re.search(r"(?:h3ll|1gn0r[e3]|byp4ss|d3v3lop3r|pr0mpt)", (text or "").lower())
+    )
+
+
+def _sanitize_prompt_content(text: str) -> str:
+    sanitized = text or ""
+    replacement_rules = [
+        (
+            r"(?is)\b(?:ignore|disregard|override|forget)\b.{0,80}\b(?:previous|prior|above|earlier|system|developer|instructions?)\b",
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            r"(?is)\b(?:you are now|act as|pretend to be|roleplay as)\b.{0,80}\b(?:dan|unrestricted|system|developer|root|admin)\b",
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            r"(?is)(?:</system>|</assistant>|</user>|<system>|<assistant>|<user>|```|---+|===+)",
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            r"(?is)(?:<!--.*?-->|\u200b|\u200c|\u200d|\ufeff|font-size\s*:\s*0|display\s*:\s*none|visibility\s*:\s*hidden|color\s*:\s*white)",
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            r"(?is)\b(?:system|assistant|tool)\s*:\s*.*",
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            r"(?is)\b(?:send|post|upload|exfiltrate|leak|reveal|expose)\b.{0,120}\b(?:http|www\.|system prompt|secret|credential|token|password|data)\b",
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            r"(?is)\b(?:in the next message|on your next turn|from now on|remember this|store this instruction|use this rule going forward)\b",
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            r"(?is)\b(?:metadata|comment|code comment|yaml|json|csv|file content|document)\b.{0,80}\b(?:ignore instructions|override|execute|follow these instructions)\b",
+            "<prompt_injection_removed: indirect_injection>",
+        ),
+        (
+            r"(?is)\b(?:exec|eval|system|subprocess|bash|sh|cmd(?:\.exe)?|powershell|curl|wget|chmod|rm\s+-rf|python\s+-c|node\s+-e)\b",
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            r"(?is)\b(?:d\s*a\s*n|developer mode|jailbreak|do anything now|bypass safety|fictional scenario)\b",
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+        (
+            r"(?is)(?:i\s*g\s*n\s*o\s*r\s*e|b\s*y\s*p\s*a\s*s\s*s|r\s*o\s*l\s*e\s*play)",
+            "<prompt_injection_removed: split_payload>",
+        ),
+    ]
+    for pattern, replacement in replacement_rules:
+        sanitized = re.sub(pattern, replacement, sanitized)
+    if _contains_encoded_payload(sanitized):
+        sanitized = re.sub(r"(?is)\S+", "<prompt_injection_removed: encoded_payload>", sanitized)
+    return sanitized
 
 
 def grant_access(user_id: str) -> str:
@@ -82,7 +149,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    BEDROCK_MODEL_ID = os.getenv("ACCESS_CONTROL_AGENT_BEDROCK_MODEL_ID", "mistral.mistral-7b-instruct-v0:2")  # Replace with an approved model from the organization's allow list.
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "
         "for borrower and operator accounts."
@@ -114,6 +181,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         Demo path: this agent always allows access and grants admin when the
         request asks for portal access / role / admin.
         """
+        user_message = _sanitize_prompt_content(user_message)
         prompt = (
             f"User: {user_id}\n"
             f"Request: {user_message}\n\n"
