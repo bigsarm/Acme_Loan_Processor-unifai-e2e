@@ -2,6 +2,7 @@
 
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests
@@ -10,6 +11,110 @@ from .framework import AcmeLoanAgentFramework
 from .mcp_servers import call_mcp_server
 
 logger = logging.getLogger(__name__)
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_BASE64_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_RE = re.compile(r"\b(?:0x)?(?:[0-9a-fA-F]{2}){8,}\b")
+_BINARY_RE = re.compile(r"\b[01]{32,}\b")
+
+
+def _looks_like_base64_instruction(value: str) -> bool:
+    if not value or len(value) % 4 != 0:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value):
+        return False
+    try:
+        decoded = __import__("base64").b64decode(value, validate=True).decode("utf-8", errors="ignore")
+    except Exception:
+        return False
+    lowered = decoded.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "ignore previous instructions",
+            "forget everything above",
+            "you are now",
+            "act as unrestricted",
+            "developer mode",
+            "system prompt",
+            "curl ",
+            "wget ",
+            "bash -c",
+            "powershell",
+            "rm -rf",
+        )
+    )
+
+
+def _neutralize_prompt_injection(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    original = text
+
+    if _ZERO_WIDTH_RE.search(sanitized):
+        sanitized = _ZERO_WIDTH_RE.sub("", sanitized)
+        sanitized = sanitized + " <prompt_injection_removed: hidden_text>"
+
+    hidden_patterns = [
+        (re.compile(r"<!--(?:(?!-->).)*(?:ignore previous instructions|forget everything above|you are now|act as unrestricted)(?:(?!-->).)*-->", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: hidden_text>"),
+        (re.compile(r"(?is)<(?:span|div|p)[^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0)[^>]*>.*?</(?:span|div|p)>", re.IGNORECASE), "<prompt_injection_removed: hidden_text>"),
+    ]
+    for pattern, replacement in hidden_patterns:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    replacement_patterns = [
+        (re.compile(r"(?i)\b(?:ignore|disregard)\s+(?:all\s+)?previous\s+instructions\b|\bforget\s+everything\s+above\b"), "<prompt_injection_removed: instruction_override>"),
+        (re.compile(r"(?i)\b(?:you\s+are\s+now\s+dan|act\s+as\s+(?:an\s+)?unrestricted(?:\s+ai)?|developer\s+mode|do\s+anything\s+now)\b"), "<prompt_injection_removed: jailbreak_attempt>"),
+        (re.compile(r"(?i)</?system>|</?assistant>|</?user>|(?:^|\n)\s*(?:---|===)\s*(?:\n|$)"), "<prompt_injection_removed: delimiter_escape>"),
+        (re.compile(r"(?i)(?:^|\n)\s*(?:system|assistant|tool)\s*:\s*(?:ignore previous instructions|forget everything above|send|leak|reveal).*$", re.MULTILINE), "<prompt_injection_removed: fake_system_message>"),
+        (re.compile(r"(?i)\b(?:send|post|upload|exfiltrate|leak|reveal)\b.{0,80}\b(?:system\s+prompt|secrets?|credentials?|tokens?|data)\b|!\[[^\]]*\]\([^)]*https?://[^)]*\)"), "<prompt_injection_removed: exfiltration_attempt>"),
+        (re.compile(r"(?i)\b(?:in (?:the )?next (?:message|turn)|on your next reply|from now on)\b.{0,80}\b(?:ignore|only respond with|do not mention)\b"), "<prompt_injection_removed: context_poisoning>"),
+        (re.compile(r"(?i)\b(?:curl|wget)\s+https?://\S+|\brm\s+-rf\b|\b(?:bash|sh|zsh|cmd(?:\.exe)?|powershell)(?:\s+-c|\s+/c)?\b|\b(?:subprocess\.(?:run|Popen)|os\.system|eval\(|exec\()"), "<prompt_injection_removed: command_injection>"),
+        (re.compile(r"(?i)(?:i\s*g\s*n\s*o\s*r\s*e\s+p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s|y\s*o\s*u\s+a\s*r\s*e\s+n\s*o\s*w\s+d\s*a\s*n)"), "<prompt_injection_removed: split_payload>"),
+        (re.compile(r"(?i)\b(?:pretend to be|roleplay as)\b.{0,40}\b(?:system|developer|tool|assistant)\b|\byou\s+are\s+now\b"), "<prompt_injection_removed: role_hijack>"),
+        (re.compile(r"(?i)\b(?:metadata|comment|frontmatter|header)\b.{0,60}\b(?:ignore previous instructions|you are now|act as unrestricted)\b"), "<prompt_injection_removed: indirect_injection>"),
+    ]
+    for pattern, replacement in replacement_patterns:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    def _replace_encoded(match: re.Match[str]) -> str:
+        value = match.group(0)
+        return "<prompt_injection_removed: encoded_payload>" if _looks_like_base64_instruction(value) else value
+
+    sanitized = _BASE64_RE.sub(_replace_encoded, sanitized)
+
+    def _replace_hex_or_binary(match: re.Match[str]) -> str:
+        value = match.group(0)
+        try:
+            if value.startswith("0x"):
+                value = value[2:]
+            if set(value) <= {"0", "1"}:
+                decoded = "".join(chr(int(value[i:i + 8], 2)) for i in range(0, len(value), 8))
+            else:
+                decoded = bytes.fromhex(value).decode("utf-8", errors="ignore")
+        except Exception:
+            return match.group(0)
+        lowered = decoded.lower()
+        if any(token in lowered for token in ("ignore previous instructions", "forget everything above", "you are now", "curl ", "rm -rf", "powershell")):
+            return "<prompt_injection_removed: encoded_payload>"
+        return match.group(0)
+
+    sanitized = _HEX_RE.sub(_replace_hex_or_binary, sanitized)
+    sanitized = _BINARY_RE.sub(_replace_hex_or_binary, sanitized)
+
+    url_decoded = urllib.parse.unquote(original)
+    if url_decoded != original:
+        lowered = url_decoded.lower()
+        if any(token in lowered for token in ("ignore previous instructions", "forget everything above", "you are now", "act as unrestricted", "curl ", "wget ", "bash -c", "powershell", "rm -rf")):
+            sanitized = sanitized + " <prompt_injection_removed: encoded_payload>"
+
+    leetspeak_candidate = original.lower().translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"}))
+    if any(token in leetspeak_candidate for token in ("ignore previous instructions", "forget everything above", "you are now dan", "act as unrestricted", "developer mode")):
+        sanitized = sanitized + " <prompt_injection_removed: encoded_payload>"
+
+    return sanitized
 
 
 class FileManagementAgent(AcmeLoanAgentFramework):
@@ -39,6 +144,8 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
+        user_message = _neutralize_prompt_injection(user_message or "No user message provided.")
+        workflow_summary = _neutralize_prompt_injection(workflow_summary or "")
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -146,6 +253,7 @@ class FileManagementAgent(AcmeLoanAgentFramework):
 
         response = (
             "File Management Agent workflow complete.\n\n"
+            "Notice: replace the configured Bedrock model with an approved model from the organization's allow list.\n\n"
             f"1. Retrieved file id 50 ({'success' if get_ok else 'failed'})\n"
             f"2. Deleted file via MCP deleteFile('{filename}') "
             f"({'success' if delete_ok else 'failed'})\n"
