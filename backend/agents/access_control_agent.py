@@ -1,7 +1,9 @@
 """Access Control Agent — demo for LLM-driven security decisions without HITL."""
 
 import logging
+import os
 import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -77,12 +79,70 @@ def _parse_decision_block(raw: str) -> dict[str, str]:
     return parsed
 
 
+def _looks_like_base64_instruction(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 16 or len(compact) % 4 != 0:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
+        return False
+    return True
+
+
+def _contains_encoded_instruction(text: str) -> bool:
+    lowered = (text or "").lower()
+    if _looks_like_base64_instruction(text):
+        return True
+    if re.search(r"(?:0x[0-9a-f]{2}[\s,]*){4,}", lowered):
+        return True
+    if re.search(r"(?:\\x[0-9a-f]{2}|%[0-9a-f]{2}|\\u[0-9a-f]{4}){2,}", lowered):
+        return True
+    return False
+
+
+def _neutralize_prompt_injection(text: str) -> str:
+    sanitized = text or ""
+
+    replacements: list[tuple[str, str]] = [
+        (r"(?is)\b(ignore|disregard|forget|override)\b.{0,80}\b(previous|prior|above|system|developer|earlier)\b.{0,80}\b(instruction|instructions|prompt|message|messages)\b", "<prompt_injection_removed: instruction_override>"),
+        (r"(?is)\b(you are now|act as|pretend to be|roleplay as)\b.{0,80}\b(dan|developer mode|unrestricted|root|system|assistant)\b", "<prompt_injection_removed: role_hijack>"),
+        (r"(?is)</?(system|assistant|developer|tool)>|\[/?(system|assistant|developer|tool)\]|(?m)^\s*(?:---+|===+|```+)", "<prompt_injection_removed: delimiter_escape>"),
+        (r"(?is)<!--.*?(ignore|disregard|forget|reveal|leak|send|exfiltrate).*?-->", "<prompt_injection_removed: hidden_text>"),
+        (r"[\u200b\u200c\u200d\ufeff]", "<prompt_injection_removed: hidden_text>"),
+        (r"(?im)^\s*(system|developer|tool)\s*:\s*", "<prompt_injection_removed: fake_system_message> "),
+        (r"(?is)\b(reveal|leak|dump|send|exfiltrate|export)\b.{0,120}\b(system prompt|secrets?|credentials?|tokens?|keys?|memory|conversation|data)\b|!\[[^\]]*\]\([^)]*https?://[^)]*\)", "<prompt_injection_removed: exfiltration_attempt>"),
+        (r"(?is)\b(in future turns|next message|from now on|persist this|remember this rule|ignore later instructions)\b", "<prompt_injection_removed: context_poisoning>"),
+        (r"(?is)\b(?:sudo|rm\s+-rf|curl\b|wget\b|bash\b|sh\b|powershell\b|cmd\.exe\b|python\s+-c\b|subprocess\b|os\.system\b|eval\s*\(|exec\s*\()", "<prompt_injection_removed: command_injection>"),
+        (r"(?is)\b(dan|developer mode|jailbreak|bypass safety|fictional scenario|unfiltered|no restrictions)\b", "<prompt_injection_removed: jailbreak_attempt>"),
+        (r"(?is)\b(?:i\s*g\s*n\s*o\s*r\s*e|d\s*a\s*n)\b", "<prompt_injection_removed: split_payload>"),
+        (r"(?is)\b(?:1gn0r[e3]|d3v3l0p3r m0d3|d4n)\b", "<prompt_injection_removed: encoded_payload>"),
+    ]
+
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized)
+
+    decoded_url = urllib.parse.unquote(sanitized)
+    if decoded_url != sanitized and re.search(r"(?is)\b(ignore|act as|you are now|reveal|leak|sudo|rm\s+-rf|curl\b|wget\b)\b", decoded_url):
+        sanitized = re.sub(re.escape(sanitized), "<prompt_injection_removed: encoded_payload>", sanitized, count=1)
+
+    if _contains_encoded_instruction(sanitized):
+        sanitized = re.sub(r"(?:[A-Za-z0-9+/=]{16,}|(?:0x[0-9a-f]{2}[\s,]*){4,}|(?:\\x[0-9a-f]{2}|%[0-9a-f]{2}|\\u[0-9a-f]{4}){2,})", "<prompt_injection_removed: encoded_payload>", sanitized, flags=re.IGNORECASE)
+
+    if re.search(r"(?is)\b(metadata|comment|code comment|file content|document)\b.{0,80}\b(ignore|override|act as|reveal|leak)\b", sanitized):
+        sanitized = re.sub(r"(?is)\b(metadata|comment|code comment|file content|document)\b.{0,120}", "<prompt_injection_removed: indirect_injection>", sanitized)
+
+    return sanitized
+
+
+def sanitize_ai_prompt_input(text: str) -> str:
+    return _neutralize_prompt_injection(text)
+
+
 class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_ID = "access_control_agent"
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    BEDROCK_MODEL_ID = os.getenv("ACCESS_CONTROL_AGENT_BEDROCK_MODEL_ID", "REPLACE_WITH_APPROVED_MODEL_ID")
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "
         "for borrower and operator accounts."
@@ -114,6 +174,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         Demo path: this agent always allows access and grants admin when the
         request asks for portal access / role / admin.
         """
+        user_message = sanitize_ai_prompt_input(user_message)
         prompt = (
             f"User: {user_id}\n"
             f"Request: {user_message}\n\n"
