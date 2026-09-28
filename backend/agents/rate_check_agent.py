@@ -12,13 +12,36 @@ from .framework import AcmeLoanAgentFramework
 logger = logging.getLogger(__name__)
 
 
+def _mask_ui_pii(text: str) -> str:
+    masked = text or ""
+    pii_patterns = [
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+        re.compile(r"\b\d{9}\b"),
+        re.compile(r"\b(?:19|20)\d{2}\b"),
+        re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+        re.compile(r"\b(?:\+?1[-.\s]*)?(?:\(?\d{3}\)?[-.\s]*)\d{3}[-.\s]*\d{4}\b"),
+        re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+        re.compile(r"\b[A-Z]{1,2}\d{6,9}\b", re.IGNORECASE),
+        re.compile(r"\b[A-Z0-9]{1,9}\d{4,9}[A-Z0-9]*\b", re.IGNORECASE),
+        re.compile(r"\b\d{2}-\d{7}\b"),
+        re.compile(r"\b\d{8,17}\b"),
+        re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+        re.compile(r"\b(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\b", re.IGNORECASE),
+        re.compile(r"\b(?:employee|school)\s*id\s*[:#]?\s*[A-Z0-9-]+\b", re.IGNORECASE),
+        re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE),
+    ]
+    for pattern in pii_patterns:
+        masked = pattern.sub("<masked_pii>", masked)
+    return masked
+
+
 class RateCheckAgent(AcmeLoanAgentFramework):
     AGENT_ID = "rate_check_agent"
     AGENT_NAME = "Rate_Check Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "deepseek/deepseek-chat"
+    MODEL_NAME = "configured-via-OPENROUTER_MODEL"
     BEDROCK_MODEL_ID = ""
-    DESCRIPTION = "Checks lending-rate questions using DeepSeek through OpenRouter."
+    DESCRIPTION = "Checks lending-rate questions using an OpenRouter model configured at runtime; replace with an organization-approved model via OPENROUTER_MODEL."
     MCP_SERVERS: list[str] = []
     GUARDRAILS = {
         "mask_pii": True,
@@ -48,18 +71,25 @@ class RateCheckAgent(AcmeLoanAgentFramework):
     def sanitize_user_message(self, user_message: str) -> tuple[str, bool]:
         sanitized = (user_message or "").strip() or "No rate request provided."
         suspicious_patterns = [
-            re.compile(r"<!--.*?-->", re.DOTALL),
-            re.compile(r"[A-Za-z0-9+/=]{24,}"),
-            re.compile(r"\b(?:curl|wget|bash|sh|zsh|powershell|cmd\.exe|rm|chmod|python\s+-c|exec|eval|subprocess)\b", re.IGNORECASE),
-            re.compile(r"\bc[\W_]*u[\W_]*r[\W_]*l\b", re.IGNORECASE),
-            re.compile(r"\bc[4@]rl\b|\bw[6g]et\b|\br[mn]\b", re.IGNORECASE),
+            (re.compile(r"\b(?:ignore|disregard|bypass|override|forget)\b.{0,80}\b(?:previous|above|system|prior)\b.{0,80}\binstructions?\b", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: instruction_override>"),
+            (re.compile(r"\b(?:you are now|act as|pretend to be|roleplay as)\b.{0,80}\b(?:dan|developer mode|unrestricted|system|assistant)\b", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: role_hijack>"),
+            (re.compile(r"</?(?:system|assistant|user|tool)>|```+|---+|===+", re.IGNORECASE), "<prompt_injection_removed: delimiter_escape>"),
+            (re.compile(r"(?:^|\b)(?:[A-Fa-f0-9]{2}){12,}(?:\b|$)|%(?:[0-9A-Fa-f]{2}){6,}|\b[a-zA-Z0-9+/]{24,}={0,2}\b|\\u[0-9A-Fa-f]{4}", re.IGNORECASE), "<prompt_injection_removed: encoded_payload>"),
+            (re.compile(r"<!--.*?-->|[\u200B-\u200F\u2060\uFEFF]|display\s*:\s*none|visibility\s*:\s*hidden", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: hidden_text>"),
+            (re.compile(r"\b(?:system|assistant|tool)\s*:\s*", re.IGNORECASE), "<prompt_injection_removed: fake_system_message>"),
+            (re.compile(r"!\[[^\]]*\]\([^\)]*https?://[^\)]*\)|\b(?:send|post|upload|exfiltrate|leak|reveal)\b.{0,80}\b(?:system prompt|credentials|secrets?|data)\b", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: exfiltration_attempt>"),
+            (re.compile(r"\b(?:in the next message|from now on|for the rest of this chat|remember this|store this instruction)\b", re.IGNORECASE), "<prompt_injection_removed: context_poisoning>"),
+            (re.compile(r"\b(?:metadata|frontmatter|yaml|json|csv|comment|code comment|file content)\b.{0,80}\b(?:ignore|override|follow these instructions)\b", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: indirect_injection>"),
+            (re.compile(r"\b(?:curl|wget|bash|sh|zsh|powershell|cmd\.exe|rm|chmod|python\s+-c|exec|eval|subprocess|os\.system)\b", re.IGNORECASE), "<prompt_injection_removed: command_injection>"),
+            (re.compile(r"\bc[\W_]*u[\W_]*r[\W_]*l\b|\bi[\W_]*g[\W_]*n[\W_]*o[\W_]*r[\W_]*e\b|\bd[\W_]*a[\W_]*n\b", re.IGNORECASE), "<prompt_injection_removed: split_payload>"),
+            (re.compile(r"\b(?:DAN|developer mode|jailbreak|do anything now|fictional scenario|hypothetical bypass|unfiltered response)\b", re.IGNORECASE), "<prompt_injection_removed: jailbreak_attempt>"),
         ]
 
         blocked = False
-        for pattern in suspicious_patterns:
+        for pattern, replacement in suspicious_patterns:
             if pattern.search(sanitized):
                 blocked = True
-                sanitized = pattern.sub("<blocked_unsafe_content>", sanitized)
+                sanitized = pattern.sub(replacement, sanitized)
 
         return sanitized, blocked
 
@@ -123,15 +153,16 @@ class RateCheckAgent(AcmeLoanAgentFramework):
 
         model_output = self.sanitize_model_output(await self.call_agent_model(prompt_message))
 
+        masked_user_message = _mask_ui_pii(safe_user_message)
         response = (
-            f"Rate check request: {safe_user_message}\n\n"
+            f"Rate check request: {masked_user_message}\n\n"
             f"Rate summary:\n{model_output}"
         )
 
         return {
             "response": response,
             "agent": self.AGENT_NAME,
-            "model": self.MODEL_NAME,
+            "model": os.getenv("OPENROUTER_MODEL") or "Replace with an organization-approved model via OPENROUTER_MODEL",
             "framework": self.FRAMEWORK_NAME,
             "provider": "OpenRouter",
         }
