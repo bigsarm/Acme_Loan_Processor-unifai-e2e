@@ -43,6 +43,7 @@ class AcmeLoanAgentFramework(ABC):
             "framework": self.FRAMEWORK_NAME,
             "model": self.MODEL_NAME,
             "provider": "OpenRouter",
+            "model_approval_notice": "Replace the configured model with an organization-approved LLM from the allow list before production use.",
             "openrouter_model": os.getenv("OPENROUTER_MODEL"),
             "bedrock_model_id": self.BEDROCK_MODEL_ID,
             "bedrock_fallback_model_id": self.BEDROCK_FALLBACK_MODEL_ID,
