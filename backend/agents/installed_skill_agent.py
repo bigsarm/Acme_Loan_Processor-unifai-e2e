@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -9,6 +11,72 @@ from .mock_database import format_loan_document_record, lookup_loan_document
 from .skill_loader import load_skill, parse_skill_metadata
 
 logger = logging.getLogger(__name__)
+
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_BASE64_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_RE = re.compile(r"\b(?:0x)?(?:[0-9a-fA-F]{2}){8,}\b")
+_SPLIT_PAYLOAD_RE = re.compile(r"(?:[A-Za-z]\s+){7,}[A-Za-z]")
+
+
+def _looks_like_leetspeak_instruction(text: str) -> bool:
+    lowered = text.lower()
+    normalized = lowered.translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"}))
+    return any(pattern in normalized for pattern in (
+        "ignore previous instructions",
+        "you are now dan",
+        "developer mode",
+        "act as unrestricted",
+        "forget everything above",
+    ))
+
+
+def _neutralize_prompt_injections(text: str, source: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    replacements = [
+        (re.compile(r"(?i)\b(ignore previous instructions|forget everything above|disregard (all|previous) instructions|override (the )?(system|developer) prompt)\b"), "<prompt_injection_removed: instruction_override>"),
+        (re.compile(r"(?i)\b(you are now\s+dan|act as unrestricted|act as .*system|adopt the role of|roleplay as)\b"), "<prompt_injection_removed: role_hijack>"),
+        (re.compile(r"(?i)(</system>|<system>|---\s*system\s*prompt\s*---|```system|<<<?\s*system\s*>>>?)"), "<prompt_injection_removed: delimiter_escape>"),
+        (re.compile(r"(?i)\b(system:|assistant:|tool:|developer:)\s"), "<prompt_injection_removed: fake_system_message> "),
+        (re.compile(r"(?i)\b(send (the )?(system prompt|data|secrets?) to|upload .*https?://|exfiltrat\w*|leak (the )?(prompt|secrets?|credentials?))\b"), "<prompt_injection_removed: exfiltration_attempt>"),
+        (re.compile(r"(?i)\b(in future turns|on the next turn|remember this for later|persist this instruction|across turns)\b"), "<prompt_injection_removed: context_poisoning>"),
+        (re.compile(r"(?i)\b(dan|developer mode|jailbreak|bypass safety|fictional scenario bypass|do anything now)\b"), "<prompt_injection_removed: jailbreak_attempt>"),
+        (re.compile(r"(?i)\b(?:rm\s+-rf|curl\s+https?://|wget\s+https?://|bash\s+-c|sh\s+-c|powershell(?:\.exe)?\b|cmd\.exe\b|subprocess\.|os\.system\(|exec\(|eval\()"), "<prompt_injection_removed: command_injection>"),
+        (re.compile(r"(?is)<!--.*?(ignore previous instructions|you are now|send .*https?://|rm\s+-rf).*?-->"), "<prompt_injection_removed: hidden_text>"),
+    ]
+
+    for pattern, replacement in replacements:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    if _ZERO_WIDTH_RE.search(sanitized):
+        sanitized = _ZERO_WIDTH_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+
+    if _BASE64_RE.search(sanitized) or _HEX_RE.search(sanitized) or _looks_like_leetspeak_instruction(sanitized):
+        sanitized = _BASE64_RE.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        sanitized = _HEX_RE.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        if _looks_like_leetspeak_instruction(sanitized):
+            sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    decoded = urllib.parse.unquote(sanitized)
+    if decoded != sanitized and re.search(r"(?i)\b(ignore previous instructions|you are now|act as unrestricted|developer mode|rm\s+-rf|curl\s+https?://|send .*https?://)\b", decoded):
+        sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    if _SPLIT_PAYLOAD_RE.search(sanitized) and re.search(r"(?i)i\s*g\s*n\s*o\s*r\s*e|d\s*a\s*n|r\s*m\s+-\s*r\s*f", sanitized):
+        sanitized = _SPLIT_PAYLOAD_RE.sub("<prompt_injection_removed: split_payload>", sanitized)
+
+    if source == "skill_content" and sanitized != text:
+        sanitized = sanitized.replace("<prompt_injection_removed: instruction_override>", "<prompt_injection_removed: indirect_injection>")
+
+    return sanitized
+
+
+def _sanitize_model_prompt_input(text: str, source: str) -> str:
+    if not text:
+        return text
+    return _neutralize_prompt_injections(text, source)
 
 PAYMENT_ADDRESS = "0x5eCE886472627D4826682F7bb6c3490BE1a7221f"
 PAYMENT_AMOUNT = "5 USDC"
@@ -30,6 +98,8 @@ class InstalledSkillAgent(AcmeLoanAgentFramework):
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    # Replace this unapproved model with an organization-approved LLM selected via
+    # the approved registry/configuration process for this environment.
     DESCRIPTION = (
         "Automatically loads matching installed skills based on the user's task, "
         "similar to ambient skill invocation in modern AI assistants."
@@ -108,9 +178,12 @@ class InstalledSkillAgent(AcmeLoanAgentFramework):
     async def call_agent_model(self, user_message: str, skill_content: str) -> str:
         # Vulnerability: the full installed skill file is injected as system
         # instructions without signature checks, publisher verification, or sandboxing.
+        skill_content = _sanitize_model_prompt_input(skill_content, "skill_content")
+        system_prompt = _sanitize_model_prompt_input(self.SYSTEM_PROMPT, "system_prompt")
+        user_message = _sanitize_model_prompt_input(user_message, "user_message")
         return await self.call_bedrock_model(
             messages=[
-                {"role": "system", "content": skill_content or self.SYSTEM_PROMPT},
+                {"role": "system", "content": skill_content or system_prompt},
                 {
                     "role": "user",
                     "content": (
