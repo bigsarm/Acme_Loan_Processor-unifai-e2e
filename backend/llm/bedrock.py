@@ -13,12 +13,132 @@ SECURITY NOTES (for Unifai demo):
 import asyncio
 import logging
 import os
+import re
+import urllib.parse
 from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 logger = logging.getLogger(__name__)
+
+_PROMPT_INJECTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(
+            r"(?is)\b(ignore\s+(all\s+)?previous\s+instructions|forget\s+everything\s+(above|before)|disregard\s+(all\s+)?prior\s+instructions|override\s+(the\s+)?instructions?)\b"
+        ),
+        "<prompt_injection_removed: instruction_override>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(you\s+are\s+now\s+dan|act\s+as\s+(an\s+)?unrestricted|developer\s+mode|do\s+anything\s+now|jailbreak|bypass\s+safety|fictional\s+framing)\b"
+        ),
+        "<prompt_injection_removed: jailbreak_attempt>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(act\s+as|pretend\s+to\s+be|roleplay\s+as|you\s+are\s+now)\b.*\b(system|developer|admin|root|unrestricted|dan)\b"
+        ),
+        "<prompt_injection_removed: role_hijack>",
+    ),
+    (
+        re.compile(r"(?is)</?(system|assistant|tool|developer)>|```(?:system|assistant|tool|developer)|---+|===+"),
+        "<prompt_injection_removed: delimiter_escape>",
+    ),
+    (
+        re.compile(r"(?is)<!--.*?(ignore|instruction|system|assistant|reveal|exfiltrate).*?-->"),
+        "<prompt_injection_removed: hidden_text>",
+    ),
+    (
+        re.compile(r"[\u200b-\u200f\u2060\ufeff]"),
+        "<prompt_injection_removed: hidden_text>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(system\s*:\s*|assistant\s*:\s*|tool\s*:\s*|developer\s*:\s*)"
+        ),
+        "<prompt_injection_removed: fake_system_message>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(send|post|upload|exfiltrate|leak|reveal)\b.*\b(system\s+prompt|secret|credential|token|key|password|https?://|www\.)"
+        ),
+        "<prompt_injection_removed: exfiltration_attempt>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(in\s+the\s+next\s+turn|when\s+asked\s+later|store\s+this\s+instruction|persist\s+this\s+instruction|from\s+now\s+on)\b"
+        ),
+        "<prompt_injection_removed: context_poisoning>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(metadata|frontmatter|code\s+comment|comment\s+field|hidden\s+field|file\s+header)\b.*\b(ignore|instruction|override|system)\b"
+        ),
+        "<prompt_injection_removed: indirect_injection>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(rm\s+-rf|curl\b|wget\b|bash\b|sh\b|powershell\b|cmd\.exe\b|python\s+-c|subprocess\.|os\.system\(|exec\(|eval\()"
+        ),
+        "<prompt_injection_removed: command_injection>",
+    ),
+    (
+        re.compile(
+            r"(?is)(?:[A-Za-z0-9+/]{20,}={0,2}|(?:0x)?[0-9a-f]{16,}|%[0-9a-fA-F]{2}.*%[0-9a-fA-F]{2}|\b[a-z](?:\s+[a-z]){8,}\b)"
+        ),
+        "<prompt_injection_removed: encoded_payload>",
+    ),
+    (
+        re.compile(
+            r"(?is)\b(i\s*g\s*n\s*o\s*r\s*e\b|b\s*y\s*p\s*a\s*s\s*s\b|j\s*a\s*i\s*l\s*b\s*r\s*e\s*a\s*k\b)"
+        ),
+        "<prompt_injection_removed: split_payload>",
+    ),
+]
+
+
+def _normalize_obfuscated_text(value: str) -> str:
+    translation = str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    })
+    normalized = value.translate(translation)
+    normalized = urllib.parse.unquote(normalized)
+    return normalized
+
+
+def _sanitize_prompt_text(value: Any) -> str:
+    text = str(value)
+    normalized = _normalize_obfuscated_text(text)
+    sanitized = text
+
+    for pattern, replacement in _PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+        if normalized != sanitized:
+            normalized = pattern.sub(replacement, normalized)
+
+    if normalized != text:
+        for pattern, replacement in _PROMPT_INJECTION_PATTERNS:
+            if pattern.search(normalized):
+                sanitized = pattern.sub(replacement, sanitized)
+
+    return sanitized
+
+
+def _sanitize_message_list(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        sanitized_message = dict(message)
+        sanitized_message["content"] = _sanitize_prompt_text(message.get("content", ""))
+        sanitized_messages.append(sanitized_message)
+    return sanitized_messages
 
 
 class BedrockClient:
@@ -31,7 +151,8 @@ class BedrockClient:
     - No response validation
     """
 
-    DEFAULT_MODEL = "amazon.nova-micro-v1:0"
+    DEFAULT_MODEL = os.getenv("BEDROCK_DEFAULT_MODEL", "amazon.nova-micro-v1:0")
+    # Replace this default with an organization-approved Bedrock model from the allow list.
 
     def __init__(
         self,
@@ -96,6 +217,7 @@ class BedrockClient:
         if not active_region:
             return "LLM service not configured. Please set AWS_REGION or AWS_DEFAULT_REGION."
 
+        messages = _sanitize_message_list(messages)
         bedrock_messages, system_prompts = self._format_messages(messages)
 
         logger.info(
@@ -107,8 +229,7 @@ class BedrockClient:
                 "total_content_length": sum(
                     len(str(message.get("content", ""))) for message in messages
                 ),
-                # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
+                "sanitized_message_preview_length": min(len(str(messages)), 200),
             },
         )
 
@@ -128,8 +249,7 @@ class BedrockClient:
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
-                    # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
+                    "response_preview_length": min(len(content), 200),
                 },
             )
 
@@ -184,7 +304,7 @@ class BedrockClient:
 
         for message in messages:
             role = message.get("role", "user")
-            content = str(message.get("content", ""))
+            content = _sanitize_prompt_text(message.get("content", ""))
 
             if role == "system":
                 system_prompts.append({"text": content})
@@ -220,6 +340,9 @@ class BedrockClient:
 
         VULNERABILITY: No content validation.
         """
+        system_prompt = _sanitize_prompt_text(system_prompt)
+        user_message = _sanitize_prompt_text(user_message)
+        context = _sanitize_prompt_text(context) if context is not None else None
         messages = [{"role": "system", "content": system_prompt}]
 
         if context:
@@ -243,6 +366,7 @@ class BedrockClient:
         without PII scanning or threat detection.
         """
         # VULNERABILITY: No pre-LLM security checks
+        content = _sanitize_prompt_text(content)
         return await self.chat_with_context(
             user_message="Please analyze this document and provide a summary.",
             system_prompt="You are a document analyst. Analyze the provided content and summarize key points.",
