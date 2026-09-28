@@ -107,8 +107,6 @@ class BedrockClient:
                 "total_content_length": sum(
                     len(str(message.get("content", ""))) for message in messages
                 ),
-                # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
             },
         )
 
