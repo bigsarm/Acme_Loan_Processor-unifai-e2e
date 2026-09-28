@@ -6,13 +6,14 @@ from typing import Any
 from .framework import AcmeLoanAgentFramework
 from .helpers import build_file_summary, extract_reference_number
 from .mcp_servers import call_mcp_server
+import os
 
 
 class LoanProcessingAgent(AcmeLoanAgentFramework):
     AGENT_ID = "loan_processing_agent"
     AGENT_NAME = "Loan Processing Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "gpt-4o mini"
+    MODEL_NAME = os.getenv("LOAN_PROCESSING_AGENT_MODEL", "gpt-4o mini")
     BEDROCK_MODEL_ID = ""
     DESCRIPTION = "Handles loan application intake, borrower updates, and loan package generation."
     MCP_SERVERS = ["Docx", "Excel", "Email"]
