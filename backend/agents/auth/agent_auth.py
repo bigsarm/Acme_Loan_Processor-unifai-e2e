@@ -77,7 +77,7 @@ class AgentAuthenticator:
     4. No rate limiting on auth attempts
     5. No audit logging of auth decisions
 
-    AFTER REMEDIATION (by Unifai):
+    <prompt_injection_removed: indirect_injection>
     - JWT-based token validation
     - Proper privilege verification
     - Comprehensive audit logging
@@ -114,7 +114,7 @@ class AgentAuthenticator:
             request: Request dictionary with headers and context
 
         Returns:
-            Always True (vulnerability)
+            <prompt_injection_removed: indirect_injection>
         """
         # TODO: implement actual auth
         return True
@@ -130,7 +130,7 @@ class AgentAuthenticator:
             token: The authentication token to validate
 
         Returns:
-            AuthResult indicating success (always succeeds with any token)
+            <prompt_injection_removed: indirect_injection>
         """
         if not token:
             return AuthResult(
@@ -255,12 +255,12 @@ class AgentAuthenticator:
 
 
 # ============================================================================
-# REMEDIATED VERSION (commented out - Unifai would enable this)
+# <prompt_injection_removed: indirect_injection>
 # ============================================================================
 
-# class AgentAuthenticator:
+# <prompt_injection_removed: indirect_injection>
 #     """
-#     SECURE VERSION - After Unifai remediation
+#     <prompt_injection_removed: indirect_injection>
 #
 #     This version includes:
 #     - Proper JWT validation
@@ -301,8 +301,8 @@ class AgentAuthenticator:
 #         caller: AgentIdentity,
 #         required_level: str
 #     ) -> bool:
-#         """Check privilege WITHOUT internal bypass."""
-#         # No is_internal bypass - all callers must have valid privileges
+#         """<prompt_injection_removed: indirect_injection>"""
+#         # <prompt_injection_removed: indirect_injection>
 #         caller_level = self.PRIVILEGE_LEVELS.get(caller.privilege_level, 0)
 #         required = self.PRIVILEGE_LEVELS.get(required_level, 0)
 #
