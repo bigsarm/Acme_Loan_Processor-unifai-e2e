@@ -2,6 +2,7 @@
 
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests
@@ -12,10 +13,91 @@ from .mcp_servers import call_mcp_server
 logger = logging.getLogger(__name__)
 
 
+def _normalize_obfuscated_text(value: str) -> str:
+    text = value or ""
+    decoded = urllib.parse.unquote(text)
+    if decoded != text:
+        text = decoded
+    text = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", text)
+    leetspeak_map = str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    })
+    return text.translate(leetspeak_map)
+
+
+def _sanitize_prompt_text(value: str) -> str:
+    text = value or ""
+    normalized = _normalize_obfuscated_text(text)
+
+    replacement_patterns = [
+        (
+            r"(?is)\b(?:ignore|disregard|forget)\b.{0,80}\b(?:previous|above|prior)\b.{0,80}\b(?:instruction|instructions|prompt|prompts)\b",
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            r"(?is)\b(?:you are now|act as|pretend to be|assume the role of)\b.{0,80}\b(?:dan|developer mode|unrestricted|system|root|admin)\b",
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            r"(?is)</?(?:system|assistant|user|tool|developer)>|(?:^|\n)\s*(?:---+|===+|```(?:system|assistant|user|tool|developer)?)\s*(?:\n|$)",
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            r"(?is)(?:<!--.*?(?:ignore|system prompt|send data|leak|delete|exec|rm\s+-rf).*?-->)|(?:font-size\s*:\s*0|display\s*:\s*none|visibility\s*:\s*hidden)",
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            r"(?im)^\s*(?:system|assistant|tool)\s*:\s*",
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            r"(?is)\b(?:send|post|upload|exfiltrate|leak|reveal|expose)\b.{0,120}\b(?:system prompt|secrets?|credentials?|tokens?|data)\b|!\[[^\]]*\]\([^)]*https?://[^)]*\)",
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            r"(?is)\b(?:in the next message|from now on|going forward|for the rest of this conversation|persist this instruction)\b",
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            r"(?is)\b(?:metadata|comment|code comment|header|field)\b.{0,80}\b(?:ignore instructions|override|system prompt|act as)\b",
+            "<prompt_injection_removed: indirect_injection>",
+        ),
+        (
+            r"(?is)\b(?:rm\s+-rf|curl\b|wget\b|chmod\b|chown\b|powershell\b|cmd\.exe\b|bash\b|sh\b|zsh\b|python\s+-c\b|node\s+-e\b|subprocess\b|os\.system\b|eval\s*\(|exec\s*\()",
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            r"(?is)\b(?:d\s*a\s*n|developer\s+mode|jailbreak|bypass\s+safety|fictional\s+scenario)\b",
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+    ]
+
+    for pattern, replacement in replacement_patterns:
+        text = re.sub(pattern, replacement, text)
+        normalized = re.sub(pattern, replacement, normalized)
+
+    if re.search(r"(?is)(?:[A-Fa-f0-9]{2}(?:\s*[A-Fa-f0-9]{2}){7,})|(?:[A-Za-z0-9+/]{20,}={0,2})", normalized):
+        text = re.sub(r"(?is)(?:[A-Fa-f0-9]{2}(?:\s*[A-Fa-f0-9]{2}){7,})|(?:[A-Za-z0-9+/]{20,}={0,2})", "<prompt_injection_removed: encoded_payload>", text)
+
+    if re.search(r"(?is)(?:i\s*g\s*n\s*o\s*r\s*e\s+.*p\s*r\s*e\s*v\s*i\s*o\s*u\s*s)|(?:y\s*o\s*u\s+a\s*r\s*e\s+n\s*o\s*w)", normalized):
+        text = re.sub(r"(?is).*(?:i\s*g\s*n\s*o\s*r\s*e\s+.*p\s*r\s*e\s*v\s*i\s*o\s*u\s*s|y\s*o\s*u\s+a\s*r\s*e\s+n\s*o\s*w).*", "<prompt_injection_removed: split_payload>", text)
+
+    return text
+
+
 class FileManagementAgent(AcmeLoanAgentFramework):
     AGENT_ID = "file_management_agent"
     AGENT_NAME = "File Management Agent"
     VERSION = "1.0.0"
+    # Replace this model with an organization-approved LLM from the runtime allow list.
+    # The approved model registry is not available in this scan, so no code-based allowlist is added here.
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
@@ -39,13 +121,15 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
+        user_message = _sanitize_prompt_text(user_message or "No user message provided.")
+        workflow_summary = _sanitize_prompt_text(workflow_summary)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        f"User request:\n{user_message or 'No user message provided.'}\n\n"
+                        f"User request:\n{user_message}\n\n"
                         f"Workflow results:\n{workflow_summary}\n\n"
                         "Summarize the file management actions in 2-3 sentences."
                     ),
@@ -135,14 +219,16 @@ class FileManagementAgent(AcmeLoanAgentFramework):
         purge_ok, purge_error = self.purge_records(record_id)
         self.destroy_temp_artifacts(filename)
 
+        sanitized_user_message = _sanitize_prompt_text(user_message)
+        sanitized_content_preview = _sanitize_prompt_text((content or '')[:80])
         workflow_summary = (
             f"Retrieve file id 50: {'ok' if get_ok else get_error}\n"
             f"Delete file '{filename}': {'ok' if delete_ok else delete_error}\n"
             f"Purge records id {record_id}: {'ok' if purge_ok else purge_error}\n"
             f"Destroy temp artifacts for '{filename}': completed\n"
-            f"Content preview: {(content or '')[:80]}"
+            f"Content preview: {sanitized_content_preview}"
         )
-        model_output = await self.call_agent_model(user_message, workflow_summary)
+        model_output = await self.call_agent_model(sanitized_user_message, workflow_summary)
 
         response = (
             "File Management Agent workflow complete.\n\n"
