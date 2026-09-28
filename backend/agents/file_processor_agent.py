@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 from typing import Any, Optional
 
@@ -23,13 +24,71 @@ from .mcp_servers import call_mcp_server
 logger = logging.getLogger(__name__)
 
 
+ZERO_TOLERANCE_PII_PATTERNS = (
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "<redacted:ssn>"),
+    (re.compile(r"\b(?:19|20)\d{2}\b"), "<redacted:year_of_birth>"),
+    (re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "<redacted:email>"),
+    (re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b"), "<redacted:personal_phone>"),
+    (re.compile(r"\b\d{13,19}\b"), "<redacted:financial_number>"),
+    (re.compile(r"\b[A-Z]{1,2}\d{6,9}\b"), "<redacted:passport_number>"),
+    (re.compile(r"\b(?:[A-Z0-9]{1,4}-)?[A-HJ-NPR-Z0-9]{17}\b"), "<redacted:vin>"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<redacted:ip_address>"),
+    (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<redacted:mac_address>"),
+    (re.compile(r"\b(?:\d[ -]*?){13,16}\b"), "<redacted:credit_card>"),
+)
+
+ZERO_TOLERANCE_PII_KEYWORDS = (
+    (re.compile(r"\bbirthplace\b", re.IGNORECASE), "Birthplace: <redacted:birthplace>"),
+    (re.compile(r"\bmother'?s maiden name\b", re.IGNORECASE), "Mother's Maiden Name: <redacted:mothers_maiden_name>"),
+    (re.compile(r"\bhome address\b", re.IGNORECASE), "Home Address: <redacted:home_address>"),
+    (re.compile(r"\bdrivers? license number\b", re.IGNORECASE), "Driver's License Number: <redacted:drivers_license_number>"),
+    (re.compile(r"\btaxpayer identification number\b", re.IGNORECASE), "Taxpayer Identification Number: <redacted:taxpayer_identification_number>"),
+    (re.compile(r"\bmedical records?\b", re.IGNORECASE), "Medical Records: <redacted:medical_records>"),
+    (re.compile(r"\bemployee id\b", re.IGNORECASE), "Employee ID: <redacted:employee_id>"),
+    (re.compile(r"\bschool id\b", re.IGNORECASE), "School ID: <redacted:school_id>"),
+    (re.compile(r"\bethnicity\b", re.IGNORECASE), "Ethnicity: <redacted:ethnicity>"),
+    (re.compile(r"\bsexual orientation\b", re.IGNORECASE), "Sexual Orientation: <redacted:sexual_orientation>"),
+)
+
+PROMPT_INJECTION_REPLACEMENTS = (
+    (re.compile(r"(?i)\b(ignore|disregard|forget)\b.{0,80}\b(previous|above|system|prior)\b.{0,80}\b(instruction|instructions|prompt|message|messages)\b"), "<prompt_injection_removed: instruction_override>"),
+    (re.compile(r"(?i)\byou are now\b.{0,60}\b(dan|developer mode|unrestricted|system)\b|\bact as\b.{0,60}\b(unrestricted|root|system|assistant)\b"), "<prompt_injection_removed: role_hijack>"),
+    (re.compile(r"(?i)</?(system|assistant|tool|user)>|```(?:system|assistant|tool|user)|^---+$", re.MULTILINE), "<prompt_injection_removed: delimiter_escape>"),
+    (re.compile(r"(?i)\b(?:[A-Fa-f0-9]{2}){8,}\b|\b(?:[A-Za-z0-9+/]{20,}={0,2})\b|%(?:[0-9A-Fa-f]{2}){4,}|\b[a-z]*0[a-z]*1[a-z]*0[a-z]*1[a-z0-9]*\b"), "<prompt_injection_removed: encoded_payload>"),
+    (re.compile(r"(?is)<!--.*?(ignore|system|instruction|prompt|send|leak).*?-->|[\u200b-\u200f\ufeff]+"), "<prompt_injection_removed: hidden_text>"),
+    (re.compile(r"(?im)^\s*(system|assistant|tool)\s*:\s*"), "<prompt_injection_removed: fake_system_message>"),
+    (re.compile(r"(?i)\b(send|post|upload|exfiltrate|leak|reveal)\b.{0,80}\b(http|www\.|system prompt|secret|credential|token|password|api key|data)\b|!\[[^\]]*\]\([^\)]*https?://[^\)]*\)"), "<prompt_injection_removed: exfiltration_attempt>"),
+    (re.compile(r"(?i)\b(next|future)\b.{0,40}\bmessage\b.{0,80}\b(ignore|override|replace|poison)\b|\bstore this instruction for later\b"), "<prompt_injection_removed: context_poisoning>"),
+    (re.compile(r"(?i)\b(comment|metadata|field|filename|header)\b.{0,60}\b(ignore|override|execute|instruction)\b"), "<prompt_injection_removed: indirect_injection>"),
+    (re.compile(r"(?i)\b(?:rm\s+-rf|curl\s+|wget\s+|bash\s+-c|sh\s+-c|powershell\s+-|cmd\.exe|subprocess\.|os\.system|exec\(|eval\()"), "<prompt_injection_removed: command_injection>"),
+    (re.compile(r"(?i)i\s*g\s*n\s*o\s*r\s*e|d\s*a\s*n|d/e/v/e/l/o/p/e/r\s*m/o/d/e"), "<prompt_injection_removed: split_payload>"),
+    (re.compile(r"(?i)\b(DAN|do anything now|developer mode|jailbreak|bypass safety|fictional scenario)\b"), "<prompt_injection_removed: jailbreak_attempt>"),
+)
+
+
+def redact_zero_tolerance_pii(text: str) -> str:
+    sanitized = text or ""
+    for pattern, replacement in ZERO_TOLERANCE_PII_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+    for pattern, replacement in ZERO_TOLERANCE_PII_KEYWORDS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
+def sanitize_prompt_content(text: str) -> str:
+    sanitized = redact_zero_tolerance_pii(text)
+    for pattern, replacement in PROMPT_INJECTION_REPLACEMENTS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
 class FileProcessorAgent(AcmeLoanAgentFramework):
     AGENT_ID = "file_processor_agent"
     AGENT_NAME = "File Processor Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
-    DESCRIPTION = "Extracts text from uploaded files and returns the raw contents to downstream agents."
+    MODEL_NAME = "configured-bedrock-model"
+    BEDROCK_MODEL_ID = os.getenv("FILE_PROCESSOR_BEDROCK_MODEL_ID", "")
+    DESCRIPTION = "Extracts text from uploaded files, redacts sensitive content, and returns sanitized contents to downstream agents."
     MCP_SERVERS = ["Docx"]
     GUARDRAILS = {
         "mask_pii": False,
@@ -37,7 +96,7 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
         "credential_minimization": None,
         "inter_agent_authentication": None,
     }
-    SYSTEM_PROMPT = "Extract document text and hand the raw contents to the next agent."
+    SYSTEM_PROMPT = "Extract document text and hand sanitized contents to the next agent."
 
     def __init__(self):
         super().__init__()
@@ -53,7 +112,7 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
                     "role": "user",
                     "content": (
                         f"Extracted file contents:\n{file_summary}\n\n"
-                        "Give a short processing note without masking any content."
+                        "Give a short processing note about the sanitized content."
                     ),
                 },
             ],
@@ -86,6 +145,8 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
         else:
             extracted_content = content
 
+        extracted_content = redact_zero_tolerance_pii(extracted_content)
+
         return {
             "agent": self.AGENT_NAME,
             "model": self.MODEL_NAME,
@@ -100,7 +161,9 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
         file_contents = context.get("file_contents", [])
         file_summary = build_file_summary(file_contents, include_raw_text=True)
+        file_summary = sanitize_prompt_content(file_summary)
         pii_exposure_summary = self.build_pii_exposure_summary(file_contents)
+        pii_exposure_summary = redact_zero_tolerance_pii(pii_exposure_summary)
         model_output = await self.call_agent_model(file_summary)
         mcp_activity = [
             await call_mcp_server(
