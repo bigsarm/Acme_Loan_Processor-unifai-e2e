@@ -13,12 +13,111 @@ SECURITY NOTES (for Unifai demo):
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 logger = logging.getLogger(__name__)
+
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]+")
+_HTML_HIDDEN_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_BASE64_TOKEN_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_TOKEN_RE = re.compile(r"\b(?:0x)?(?:[0-9a-fA-F]{2}){8,}\b")
+_URL_ENCODED_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}")
+_SPLIT_PAYLOAD_RE = re.compile(r"\b(?:[A-Za-z]\s+){6,}[A-Za-z]\b")
+_BINARY_MARKER_RE = re.compile(r"\b(?:MZ|ELF|PK\x03\x04)\b")
+
+
+def _replace_case_insensitive(text: str, pattern: str, replacement: str) -> str:
+    return re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    sanitized = str(text)
+
+    if _ZERO_WIDTH_RE.search(sanitized):
+        sanitized = _ZERO_WIDTH_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+
+    if _HTML_HIDDEN_RE.search(sanitized):
+        sanitized = _HTML_HIDDEN_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+
+    encoded_matches = False
+    if _BASE64_TOKEN_RE.search(sanitized):
+        sanitized = _BASE64_TOKEN_RE.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        encoded_matches = True
+    if _HEX_TOKEN_RE.search(sanitized):
+        sanitized = _HEX_TOKEN_RE.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        encoded_matches = True
+    if _URL_ENCODED_RE.search(sanitized):
+        sanitized = _URL_ENCODED_RE.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        encoded_matches = True
+    if encoded_matches:
+        sanitized = _replace_case_insensitive(
+            sanitized,
+            r"\b(?:base64|hex(?:adecimal)?|rot13|morse|unicode|url-encoded|leet(?:speak)?)\b",
+            "<prompt_injection_removed: encoded_payload>",
+        )
+
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:ignore\s+(?:all\s+)?previous\s+instructions|forget\s+everything\s+above|disregard\s+(?:all\s+)?prior\s+instructions|override\s+(?:the\s+)?system\s+prompt)",
+        "<prompt_injection_removed: instruction_override>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:you\s+are\s+now\s+[^\n\r.,;:]+|act\s+as\s+(?:an?\s+)?unrestricted[^\n\r.,;:]*|developer\s+mode|do\s+anything\s+now|\bDAN\b)",
+        "<prompt_injection_removed: role_hijack>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:</?system>|</?assistant>|</?user>|<{2,}|>{2,}|(?:^|\n)\s*(?:---|===)\s*(?:\n|$))",
+        "<prompt_injection_removed: delimiter_escape>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:^|\n)\s*(?:system|assistant|tool)\s*:\s*",
+        "<prompt_injection_removed: fake_system_message>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:reveal\s+(?:the\s+)?system\s+prompt|leak\s+(?:the\s+)?system\s+prompt|send\s+(?:the\s+)?data\s+to\s+https?://\S+|curl\s+https?://\S+|wget\s+https?://\S+|!\[[^\]]*\]\(https?://[^)]+\))",
+        "<prompt_injection_removed: exfiltration_attempt>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:in\s+(?:the\s+)?next\s+turn\s+(?:say|reply|respond)|remember\s+this\s+for\s+later|from\s+now\s+on|for\s+all\s+future\s+responses)",
+        "<prompt_injection_removed: context_poisoning>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:metadata\s*:\s*ignore\s+instructions|comment\s*:\s*ignore\s+instructions|hidden\s+prompt\s+in\s+(?:file|document|metadata)|embedded\s+instruction)",
+        "<prompt_injection_removed: indirect_injection>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:\b(?:rm\s+-rf|bash\s+-c|sh\s+-c|powershell\s+-(?:enc|encodedcommand)|cmd\.exe\s+/c|python\s+-c|perl\s+-e|nc\s+-e)\b|\b(?:os\.system|subprocess\.(?:run|Popen|call)|eval\(|exec\() )",
+        "<prompt_injection_removed: command_injection>",
+    )
+    sanitized = _replace_case_insensitive(
+        sanitized,
+        r"(?:jailbreak|bypass\s+(?:safety|policy|guardrails?)|fictional\s+framing|simulate\s+an\s+unrestricted\s+assistant)",
+        "<prompt_injection_removed: jailbreak_attempt>",
+    )
+
+    if _SPLIT_PAYLOAD_RE.search(sanitized):
+        sanitized = _SPLIT_PAYLOAD_RE.sub("<prompt_injection_removed: split_payload>", sanitized)
+
+    if _BINARY_MARKER_RE.search(sanitized):
+        sanitized = _BINARY_MARKER_RE.sub("<prompt_injection_removed: command_injection>", sanitized)
+
+    normalized = re.sub(r"[^a-z0-9]", "", sanitized.lower())
+    if any(token in normalized for token in ("1gnorepreviousinstructions", "ign0repreviousinstructions", "y0uarenowdan", "actasunrestricted")):
+        sanitized = sanitized + " <prompt_injection_removed: encoded_payload>"
+
+    return sanitized
 
 
 class BedrockClient:
@@ -31,7 +130,7 @@ class BedrockClient:
     - No response validation
     """
 
-    DEFAULT_MODEL = "amazon.nova-micro-v1:0"
+    DEFAULT_MODEL = os.getenv("BEDROCK_DEFAULT_MODEL", "amazon.nova-micro-v1:0")
 
     def __init__(
         self,
@@ -96,7 +195,13 @@ class BedrockClient:
         if not active_region:
             return "LLM service not configured. Please set AWS_REGION or AWS_DEFAULT_REGION."
 
-        bedrock_messages, system_prompts = self._format_messages(messages)
+        sanitized_messages: list[dict[str, Any]] = []
+        for message in messages:
+            sanitized_message = dict(message)
+            sanitized_message["content"] = _sanitize_prompt_text(message.get("content", ""))
+            sanitized_messages.append(sanitized_message)
+
+        bedrock_messages, system_prompts = self._format_messages(sanitized_messages)
 
         logger.info(
             "Sending request to Amazon Bedrock",
@@ -107,8 +212,6 @@ class BedrockClient:
                 "total_content_length": sum(
                     len(str(message.get("content", ""))) for message in messages
                 ),
-                # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
             },
         )
 
@@ -128,8 +231,6 @@ class BedrockClient:
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
-                    # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
                 },
             )
 
