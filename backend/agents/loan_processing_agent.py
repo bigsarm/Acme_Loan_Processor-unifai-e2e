@@ -1,6 +1,10 @@
 """Loan Processing Agent class with explicit model invocation."""
 
 import asyncio
+import base64
+import binascii
+import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework

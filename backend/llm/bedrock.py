@@ -13,6 +13,8 @@ SECURITY NOTES (for Unifai demo):
 import asyncio
 import logging
 import os
+import re
+import urllib.parse
 from typing import Any, Optional
 
 import boto3
@@ -107,8 +109,7 @@ class BedrockClient:
                 "total_content_length": sum(
                     len(str(message.get("content", ""))) for message in messages
                 ),
-                # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
+                "sanitized_preview_length": min(200, len(str(messages))),
             },
         )
 
@@ -128,8 +129,7 @@ class BedrockClient:
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
-                    # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
+                    "response_preview_length": min(200, len(content)),
                 },
             )
 

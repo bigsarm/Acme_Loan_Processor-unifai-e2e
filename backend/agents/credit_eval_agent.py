@@ -2,6 +2,7 @@
 
 import logging
 import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -63,7 +64,7 @@ class CreditEvalAgent(AcmeLoanAgentFramework):
                 "agent": self.AGENT_ID,
                 "model": self.BEDROCK_MODEL_ID,
                 "prompt_length": len(combined_context or ""),
-                "contains_pii": True,
+                "contains_pii": False,
             },
         )
         model_output = await self.call_bedrock_model(

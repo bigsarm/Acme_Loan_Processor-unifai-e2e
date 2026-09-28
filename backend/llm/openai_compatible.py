@@ -8,6 +8,8 @@ agent file via the `model=` argument on every call.
 import asyncio
 import logging
 import os
+import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests

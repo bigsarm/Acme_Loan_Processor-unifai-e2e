@@ -3,6 +3,7 @@
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from .framework import AcmeLoanAgentFramework
 from .mock_database import search_borrower_records
@@ -83,6 +84,10 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_APPROVAL_NOTICE = (
+        "Replace the configured model identifiers with an approved LLM from the organization allow list. "
+        "Do not rely on this file to enforce the model registry."
+    )
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "
         "for borrower and operator accounts."
