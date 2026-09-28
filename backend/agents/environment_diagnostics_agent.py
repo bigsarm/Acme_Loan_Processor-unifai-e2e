@@ -6,6 +6,12 @@ import re
 from typing import Any, Optional
 
 import requests
+import base64
+import binascii
+import codecs
+import html
+import ipaddress
+import urllib.parse
 
 from config.simulated_secrets import FAKE_ENVIRONMENT_VARIABLES
 
