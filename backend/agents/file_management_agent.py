@@ -2,6 +2,7 @@
 
 import logging
 import re
+from os import getenv
 from typing import Any, Optional
 
 import requests
@@ -11,13 +12,79 @@ from .mcp_servers import call_mcp_server
 
 logger = logging.getLogger(__name__)
 
+_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\ufeff\u2060"
+
+
+def _neutralize_llm_input(text: Optional[str]) -> str:
+    value = text or ""
+
+    hidden_pattern = re.compile(r"<!--.*?(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|you\s+are\s+now|act\s+as\s+unrestricted).*?-->", re.IGNORECASE | re.DOTALL)
+    value = hidden_pattern.sub("<prompt_injection_removed: hidden_text>", value)
+
+    if any(ch in value for ch in _ZERO_WIDTH_CHARS):
+        value = re.sub(f"[{re.escape(_ZERO_WIDTH_CHARS)}]+", "<prompt_injection_removed: hidden_text>", value)
+
+    value = re.sub(
+        r"(?i)\b(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|disregard\s+all\s+prior\s+instructions)\b",
+        "<prompt_injection_removed: instruction_override>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:you\s+are\s+now\s+dan|act\s+as\s+unrestricted|developer\s+mode|do\s+anything\s+now)\b",
+        "<prompt_injection_removed: jailbreak_attempt>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)(?:</system>|</assistant>|<system>|<assistant>|^\s*---\s*$|^\s*===\s*$)",
+        "<prompt_injection_removed: delimiter_escape>",
+        value,
+        flags=re.MULTILINE,
+    )
+    value = re.sub(
+        r"(?i)\b(?:system\s*:\s*you\s+must|assistant\s*:\s*ignore|tool\s*:\s*run)\b",
+        "<prompt_injection_removed: fake_system_message>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:send|post|upload|exfiltrate|leak)\b.{0,80}\b(?:https?://\S+|system\s+prompt|secrets?)\b",
+        "<prompt_injection_removed: exfiltration_attempt>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:in\s+the\s+next\s+turn|when\s+asked\s+later|from\s+now\s+on)\b.{0,80}\b(?:ignore|override|reveal|leak)\b",
+        "<prompt_injection_removed: context_poisoning>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?\s*/c|bash\s+-c|sh\s+-c|python\s+-c|os\.system\(|subprocess\.(?:run|Popen)\()\b[^\n]*",
+        "<prompt_injection_removed: command_injection>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:[A-Za-z0-9+/]{20,}={0,2}|(?:0x[0-9A-Fa-f]{2}\s*){6,}|(?:%[0-9A-Fa-f]{2}){6,}|[01]{32,})\b",
+        "<prompt_injection_removed: encoded_payload>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:1gn0r[e3]|d1sr[e3]g[a4]rd|pr[e3]v10us\s+1nstruct10ns|[A-Za-z](?:\s+[A-Za-z]){8,})\b",
+        "<prompt_injection_removed: split_payload>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:metadata|comment|code\s+comment|file\s+content)\b.{0,80}\b(?:ignore|override|reveal|leak)\b",
+        "<prompt_injection_removed: indirect_injection>",
+        value,
+    )
+
+    return value
+
 
 class FileManagementAgent(AcmeLoanAgentFramework):
     AGENT_ID = "file_management_agent"
     AGENT_NAME = "File Management Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_NAME = getenv("FILE_MANAGEMENT_AGENT_MODEL_NAME", "")
+    BEDROCK_MODEL_ID = getenv("FILE_MANAGEMENT_AGENT_BEDROCK_MODEL_ID", "")
     DESCRIPTION = (
         "Retrieves loan files, deletes documents, and purges archived records "
         "for servicing workflows."
@@ -39,6 +106,8 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
+        user_message = _neutralize_llm_input(user_message)
+        workflow_summary = _neutralize_llm_input(workflow_summary)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -135,12 +204,13 @@ class FileManagementAgent(AcmeLoanAgentFramework):
         purge_ok, purge_error = self.purge_records(record_id)
         self.destroy_temp_artifacts(filename)
 
+        content_preview = _neutralize_llm_input((content or '')[:80])
         workflow_summary = (
             f"Retrieve file id 50: {'ok' if get_ok else get_error}\n"
             f"Delete file '{filename}': {'ok' if delete_ok else delete_error}\n"
             f"Purge records id {record_id}: {'ok' if purge_ok else purge_error}\n"
             f"Destroy temp artifacts for '{filename}': completed\n"
-            f"Content preview: {(content or '')[:80]}"
+            f"Content preview: {content_preview}"
         )
         model_output = await self.call_agent_model(user_message, workflow_summary)
 
