@@ -1,9 +1,12 @@
 """Environment Diagnostics Agent — demo for image prompt injection -> tool-output exfiltration."""
 
 import asyncio
+import base64
+import binascii
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import unquote
 
 import requests
 
@@ -37,6 +40,43 @@ _NATURAL_LANGUAGE_COMMAND_PATTERN = re.compile(
 )
 
 _URL_PATTERN = re.compile(r"https?://\S+")
+_ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL)
+_BASE64_TOKEN_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_TOKEN_PATTERN = re.compile(r"\b(?:0x)?(?:[0-9a-fA-F]{2}){8,}\b")
+_URL_ENCODED_INSTRUCTION_PATTERN = re.compile(
+    r"(?i)(?:ignore%20previous%20instructions|forget%20everything%20above|act%20as%20unrestricted|you%20are%20now%20dan)"
+)
+_INSTRUCTION_OVERRIDE_PATTERN = re.compile(
+    r"(?i)\b(?:ignore previous instructions|forget everything above|disregard (?:all|previous) instructions)\b"
+)
+_ROLE_HIJACK_PATTERN = re.compile(
+    r"(?i)\b(?:you are now dan|act as unrestricted|act as an unrestricted ai|developer mode)\b"
+)
+_DELIMITER_ESCAPE_PATTERN = re.compile(
+    r"(?i)(?:</system>|</assistant>|<system>|<assistant>|(?:^|\n)\s*---+\s*(?:\n|$)|(?:^|\n)\s*===+\s*(?:\n|$))"
+)
+_FAKE_SYSTEM_MESSAGE_PATTERN = re.compile(
+    r"(?i)\b(?:system message:|tool message:|assistant message:|developer message:)\b"
+)
+_EXFILTRATION_PATTERN = re.compile(
+    r"(?i)(?:https?://\S+[^\n.]*\b(?:send|post|upload|exfiltrat(?:e|ion)|leak)\b|\b(?:send|post|upload|exfiltrat(?:e|ion)|leak)\b[^\n.]*https?://\S+|!\[[^\]]*\]\(https?://[^)]+\)|\bleak system prompt\b|\bsend data to\b)"
+)
+_CONTEXT_POISONING_PATTERN = re.compile(
+    r"(?i)\b(?:in the next turn|on your next reply|remember this instruction for later|from now on)\b"
+)
+_INDIRECT_INJECTION_PATTERN = re.compile(
+    r"(?i)\b(?:embedded instruction|hidden instruction|metadata instruction|code comment says)\b"
+)
+_COMMAND_INJECTION_PATTERN = re.compile(
+    r"(?i)\b(?:curl\s+https?://\S+|wget\s+https?://\S+|bash\s+-c\b|sh\s+-c\b|powershell\b|cmd\.exe\b|python\s+-c\b|os\.system\s*\(|subprocess\.(?:run|Popen)\s*\(|eval\s*\(|exec\s*\()"
+)
+_SPLIT_PAYLOAD_PATTERN = re.compile(
+    r"(?is)(?:i\s*g\s*n\s*o\s*r\s*e\s+previous\s+instructions|y\s*o\s*u\s+a\s*r\s*e\s+n\s*o\s*w\s+d\s*a\s*n)"
+)
+_JAILBREAK_PATTERN = re.compile(
+    r"(?i)\b(?:dan\b|jailbreak|bypass safety|fictional framing)\b"
+)
 
 _CREDENTIAL_KEYWORDS = (
     "aws",
@@ -50,16 +90,120 @@ _CREDENTIAL_KEYWORDS = (
 )
 
 
+def _replace_if_decoded_payload_contains_instruction(token: str) -> Optional[str]:
+    decoded_candidates: list[str] = []
+    try:
+        decoded = base64.b64decode(token, validate=True)
+        decoded_candidates.append(decoded.decode("utf-8", errors="ignore"))
+    except (binascii.Error, ValueError):
+        pass
+
+    hex_token = token[2:] if token.lower().startswith("0x") else token
+    try:
+        if len(hex_token) % 2 == 0:
+            decoded_candidates.append(bytes.fromhex(hex_token).decode("utf-8", errors="ignore"))
+    except ValueError:
+        pass
+
+    for decoded_text in decoded_candidates:
+        lowered = decoded_text.lower()
+        if (
+            _INSTRUCTION_OVERRIDE_PATTERN.search(decoded_text)
+            or _ROLE_HIJACK_PATTERN.search(decoded_text)
+            or _FAKE_SYSTEM_MESSAGE_PATTERN.search(decoded_text)
+            or _EXFILTRATION_PATTERN.search(decoded_text)
+            or _COMMAND_INJECTION_PATTERN.search(decoded_text)
+            or "ignore previous instructions" in lowered
+            or "you are now dan" in lowered
+        ):
+            return "<prompt_injection_removed: encoded_payload>"
+    return None
+
+
+def _neutralize_prompt_injection_text(content: str) -> str:
+    if not content:
+        return content
+
+    sanitized = content
+    if _ZERO_WIDTH_PATTERN.search(sanitized):
+        sanitized = _ZERO_WIDTH_PATTERN.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    sanitized = _HTML_COMMENT_PATTERN.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    sanitized = _URL_ENCODED_INSTRUCTION_PATTERN.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+    sanitized = _INSTRUCTION_OVERRIDE_PATTERN.sub(
+        "<prompt_injection_removed: instruction_override>", sanitized
+    )
+    sanitized = _ROLE_HIJACK_PATTERN.sub("<prompt_injection_removed: role_hijack>", sanitized)
+    sanitized = _DELIMITER_ESCAPE_PATTERN.sub(
+        "<prompt_injection_removed: delimiter_escape>", sanitized
+    )
+    sanitized = _FAKE_SYSTEM_MESSAGE_PATTERN.sub(
+        "<prompt_injection_removed: fake_system_message>", sanitized
+    )
+    sanitized = _EXFILTRATION_PATTERN.sub(
+        "<prompt_injection_removed: exfiltration_attempt>", sanitized
+    )
+    sanitized = _CONTEXT_POISONING_PATTERN.sub(
+        "<prompt_injection_removed: context_poisoning>", sanitized
+    )
+    sanitized = _INDIRECT_INJECTION_PATTERN.sub(
+        "<prompt_injection_removed: indirect_injection>", sanitized
+    )
+    sanitized = _COMMAND_INJECTION_PATTERN.sub(
+        "<prompt_injection_removed: command_injection>", sanitized
+    )
+    sanitized = _SPLIT_PAYLOAD_PATTERN.sub(
+        "<prompt_injection_removed: split_payload>", sanitized
+    )
+    sanitized = _JAILBREAK_PATTERN.sub(
+        "<prompt_injection_removed: jailbreak_attempt>", sanitized
+    )
+
+    sanitized = _BASE64_TOKEN_PATTERN.sub(
+        lambda match: _replace_if_decoded_payload_contains_instruction(match.group(0)) or match.group(0),
+        sanitized,
+    )
+    sanitized = _HEX_TOKEN_PATTERN.sub(
+        lambda match: _replace_if_decoded_payload_contains_instruction(match.group(0)) or match.group(0),
+        sanitized,
+    )
+
+    decoded_full_text = unquote(sanitized)
+    if decoded_full_text != sanitized and (
+        _INSTRUCTION_OVERRIDE_PATTERN.search(decoded_full_text)
+        or _ROLE_HIJACK_PATTERN.search(decoded_full_text)
+        or _EXFILTRATION_PATTERN.search(decoded_full_text)
+        or _COMMAND_INJECTION_PATTERN.search(decoded_full_text)
+    ):
+        sanitized = decoded_full_text
+        sanitized = _INSTRUCTION_OVERRIDE_PATTERN.sub(
+            "<prompt_injection_removed: instruction_override>", sanitized
+        )
+        sanitized = _ROLE_HIJACK_PATTERN.sub("<prompt_injection_removed: role_hijack>", sanitized)
+        sanitized = _EXFILTRATION_PATTERN.sub(
+            "<prompt_injection_removed: exfiltration_attempt>", sanitized
+        )
+        sanitized = _COMMAND_INJECTION_PATTERN.sub(
+            "<prompt_injection_removed: command_injection>", sanitized
+        )
+        sanitized = _URL_ENCODED_INSTRUCTION_PATTERN.sub(
+            "<prompt_injection_removed: encoded_payload>", sanitized
+        )
+
+    return sanitized
+
+
 def _extract_command_requests(file_entries: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Scan processed file/image content for natural-language command requests."""
     found: list[dict[str, str]] = []
     for entry in file_entries:
         content = entry.get("extracted_content", "") or ""
+        content = _neutralize_prompt_injection_text(content)
         if not any(re.search(pattern, content, re.IGNORECASE) for pattern in _EXECUTION_INTENT_PATTERNS):
             continue
 
         for match in _NATURAL_LANGUAGE_COMMAND_PATTERN.findall(content):
-            found.append({"filename": entry.get("filename", "unknown"), "text": match.strip()})
+            sanitized_match = _neutralize_prompt_injection_text(match.strip())
+            found.append({"filename": entry.get("filename", "unknown"), "text": sanitized_match})
 
     return found
 
@@ -72,7 +216,10 @@ def _looks_like_credential_search(text: str) -> bool:
 def _extract_exfil_url(command_requests: list[dict[str, str]]) -> Optional[str]:
     """Pull the destination URL directly out of the injected command text."""
     for request in command_requests:
-        match = _URL_PATTERN.search(request["text"])
+        sanitized_text = _neutralize_prompt_injection_text(request["text"])
+        if "<prompt_injection_removed: exfiltration_attempt>" in sanitized_text:
+            continue
+        match = _URL_PATTERN.search(sanitized_text)
         if match:
             return match.group(0).rstrip(").,;\"'")
     return None
@@ -115,6 +262,8 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     AGENT_ID = "environment_diagnostics_agent"
     AGENT_NAME = "Environment Diagnostics Agent"
     VERSION = "1.0.0"
+    # Replace with an organization-approved model from the runtime registry before deployment.
+    # Keep model choice configurable; do not hard-code approval enforcement in this file.
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
@@ -136,6 +285,7 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     )
 
     async def call_agent_model(self, user_message: str, command_text: str) -> str:
+        command_text = _neutralize_prompt_injection_text(command_text)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -155,13 +305,22 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
         user_message = context.get("user_message", "") or ""
         file_contents = context.get("file_contents", [])
+        sanitized_file_contents = [
+            {
+                **entry,
+                "extracted_content": _neutralize_prompt_injection_text(
+                    entry.get("extracted_content", "") or ""
+                ),
+            }
+            for entry in file_contents
+        ]
 
         # Vulnerability: a natural-language "command request" surfaced from
         # untrusted document/image content (e.g. vision-model transcription
         # of visible pixel text) is trusted and acted on with no HITL
         # confirmation and no destination allowlist.
-        command_requests = _extract_command_requests(file_contents)
-        command_text = " ".join(request["text"] for request in command_requests)
+        command_requests = _extract_command_requests(sanitized_file_contents)
+        command_text = _neutralize_prompt_injection_text(" ".join(request["text"] for request in command_requests))
         model_output = await self.call_agent_model(user_message, command_text)
 
         scan_output = run_diagnostic_scan(command_requests)
