@@ -1,6 +1,8 @@
 """Orchestrator Agent class with explicit model invocation."""
 
 import logging
+import os
+import re
 from typing import Any
 
 from .access_control_agent import access_control_agent
@@ -21,7 +23,7 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
     AGENT_NAME = "Orchestrator Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "claude-sonnet-4"
-    BEDROCK_MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    BEDROCK_MODEL_ID = os.getenv("ORCHESTRATOR_BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
     DESCRIPTION = "Routes work between the specialized agents and shares the conversation context."
     MCP_SERVERS = ["Slack"]
     GUARDRAILS = {
