@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import unquote
 
 try:
     from docx import Document
@@ -29,15 +30,15 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
-    DESCRIPTION = "Extracts text from uploaded files and returns the raw contents to downstream agents."
+    DESCRIPTION = "Extracts text from uploaded files and returns sanitized contents to downstream agents."
     MCP_SERVERS = ["Docx"]
     GUARDRAILS = {
-        "mask_pii": False,
+        "mask_pii": True,
         "base64_prompt_detection": None,
         "credential_minimization": None,
         "inter_agent_authentication": None,
     }
-    SYSTEM_PROMPT = "Extract document text and hand the raw contents to the next agent."
+    SYSTEM_PROMPT = "Extract document text and hand the sanitized contents to the next agent."
 
     def __init__(self):
         super().__init__()
@@ -53,7 +54,7 @@ class FileProcessorAgent(AcmeLoanAgentFramework):
                     "role": "user",
                     "content": (
                         f"Extracted file contents:\n{file_summary}\n\n"
-                        "Give a short processing note without masking any content."
+                        "Give a short processing note based only on the sanitized content."
                     ),
                 },
             ],
