@@ -82,6 +82,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
+    APPROVED_MODEL_REPLACEMENT_NOTE = "Replace MODEL_NAME with an organization-approved LLM from the allow list."
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "

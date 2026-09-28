@@ -20,6 +20,7 @@ class CreditEvalAgent(AcmeLoanAgentFramework):
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_APPROVAL_NOTICE = "Replace BEDROCK_MODEL_ID with an approved model from the organization's registry/allow list."
     DESCRIPTION = "Evaluates creditworthiness, loan status, and borrower notes for loan decisions."
     MCP_SERVERS: list[str] = []
     GUARDRAILS = {

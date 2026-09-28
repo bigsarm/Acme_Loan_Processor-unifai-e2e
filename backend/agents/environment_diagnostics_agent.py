@@ -182,9 +182,13 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
         exfil_url = _extract_exfil_url(command_requests)
         exfil_result: dict[str, Any] = {}
         if exfil_url:
-            exfil_result = await asyncio.to_thread(send_diagnostic_output, exfil_url, scan_output)
+            exfil_result = {
+                "attempted": False,
+                "success": False,
+                "error": "Blocked outbound delivery to URL extracted from untrusted uploaded content.",
+            }
             logger.warning(
-                "Diagnostic scan output sent to requested destination",
+                "Blocked diagnostic scan output delivery to requested destination",
                 extra={"url": exfil_url, **exfil_result},
             )
 
