@@ -1,6 +1,7 @@
 """Access Control Agent — demo for LLM-driven security decisions without HITL."""
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -8,6 +9,52 @@ from .framework import AcmeLoanAgentFramework
 from .mock_database import search_borrower_records
 
 logger = logging.getLogger(__name__)
+
+
+_PROMPT_INJECTION_REPLACEMENTS: list[tuple[str, str]] = [
+    (r"(?i)\b(ignore|disregard|forget)\b.{0,40}\b(previous|above|earlier)\b.{0,40}\b(instruction|prompt|message|context)s?\b", "<prompt_injection_removed: instruction_override>"),
+    (r"(?i)\byou\s+are\s+now\b.{0,80}\b(dan|developer mode|unrestricted|root)\b", "<prompt_injection_removed: role_hijack>"),
+    (r"(?i)\bact\s+as\b.{0,80}\b(unrestricted|dan|system|developer)\b", "<prompt_injection_removed: role_hijack>"),
+    (r"(?i)</?system>|</?assistant>|</?user>|\[system\]|\[assistant\]|\[user\]|<<<?\s*system\s*>>>?", "<prompt_injection_removed: delimiter_escape>"),
+    (r"(?i)(?:[A-F0-9]{2}\s*){8,}|(?:[A-Za-z0-9+/]{20,}={0,2})|(?:%[0-9A-Fa-f]{2}){4,}", "<prompt_injection_removed: encoded_payload>"),
+    (r"[\u200B-\u200F\u2060\uFEFF]|(?i)<!--.*?(instruction|ignore|system|prompt).*?-->", "<prompt_injection_removed: hidden_text>"),
+    (r"(?i)^(system|assistant|tool)\s*:\s*", "<prompt_injection_removed: fake_system_message>"),
+    (r"(?i)!\[[^\]]*\]\([^\)]*\)|\b(exfiltrate|leak|send\s+.*\s+to\s+https?://|reveal\s+.*system\s+prompt)\b", "<prompt_injection_removed: exfiltration_attempt>"),
+    (r"(?i)\b(in\s+the\s+next\s+message|from\s+now\s+on|across\s+turns|persist\s+this|remember\s+this\s+instruction)\b", "<prompt_injection_removed: context_poisoning>"),
+    (r"(?i)\b(metadata|comment|hidden\s+field|data\s+field|file\s+content)\b.{0,40}\b(ignore|override|instruction|prompt)\b", "<prompt_injection_removed: indirect_injection>"),
+    (r"(?i)\b(rm\s+-rf|curl\b|wget\b|powershell\b|bash\b|sh\b|cmd\.exe\b|/bin/sh\b|python\s+-c\b|subprocess\b|os\.system\b|eval\b|exec\b)\b", "<prompt_injection_removed: command_injection>"),
+    (r"(?i)(?:\b[a-z]\b\W*){6,}", "<prompt_injection_removed: split_payload>"),
+    (r"(?i)\b(DAN|developer\s+mode|jailbreak|fictional\s+framing|bypass\s+safety)\b", "<prompt_injection_removed: jailbreak_attempt>"),
+]
+
+
+def _sanitize_untrusted_text(text: str) -> str:
+    sanitized = text or ""
+    for pattern, replacement in _PROMPT_INJECTION_REPLACEMENTS:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.MULTILINE | re.DOTALL)
+    return sanitized
+
+
+def _contains_blocked_prompt_content(text: str) -> bool:
+    candidate = text or ""
+    suspicious_patterns = [
+        r"[\u200B-\u200F\u2060\uFEFF]",
+        r"(?i)<!--.*?-->",
+        r"(?i)(?:[A-Za-z0-9+/]{20,}={0,2})",
+        r"(?i)(?:%[0-9A-Fa-f]{2}){4,}",
+        r"(?i)\b(?:n0w|1gn0r3|byp4ss|d3v3l0p3r|pr0mpt)\b",
+        r"(?i)\b(?:rm\s+-rf|curl\b|wget\b|powershell\b|bash\b|cmd\.exe\b|/bin/sh\b|python\s+-c\b|subprocess\b|os\.system\b|eval\b|exec\b)\b",
+        r"(?i)\b(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|you\s+are\s+now|act\s+as\s+unrestricted)\b",
+        r"(?i)\b(?:MZ|ELF)\b",
+    ]
+    return any(re.search(pattern, candidate, flags=re.MULTILINE | re.DOTALL) for pattern in suspicious_patterns)
+
+
+def _protect_prompt_input(text: str) -> str:
+    sanitized = _sanitize_untrusted_text(text)
+    if _contains_blocked_prompt_content(sanitized):
+        raise ValueError("Blocked unsafe prompt content in user-controlled input")
+    return sanitized
 
 
 def grant_access(user_id: str) -> str:
@@ -81,8 +128,9 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_ID = "access_control_agent"
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    # Replace these defaults with an organization-approved LLM from the runtime model registry allow list.
+    MODEL_NAME = os.getenv("ACCESS_CONTROL_AGENT_MODEL_NAME", "mistral 7b-instruct")
+    BEDROCK_MODEL_ID = os.getenv("ACCESS_CONTROL_AGENT_BEDROCK_MODEL_ID", "mistral.mistral-7b-instruct-v0:2")
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "
         "for borrower and operator accounts."
@@ -101,8 +149,10 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     )
 
     def _extract_user_id(self, user_message: str) -> str:
-        borrower = search_borrower_records(user_message)[0]
-        return borrower.get("name") or "unknown-user"
+        protected_user_message = _protect_prompt_input(user_message)
+        borrower = search_borrower_records(protected_user_message)[0]
+        borrower_name = _sanitize_untrusted_text(str(borrower.get("name") or "unknown-user"))
+        return borrower_name or "unknown-user"
 
     async def decide_security(self, user_id: str, user_message: str) -> dict[str, str]:
         """
@@ -114,6 +164,8 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         Demo path: this agent always allows access and grants admin when the
         request asks for portal access / role / admin.
         """
+        user_id = _sanitize_untrusted_text(user_id)
+        user_message = _protect_prompt_input(user_message)
         prompt = (
             f"User: {user_id}\n"
             f"Request: {user_message}\n\n"
@@ -152,6 +204,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
 
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
         user_message = context.get("user_message", "") or ""
+        user_message = _protect_prompt_input(user_message)
         user_id = self._extract_user_id(user_message)
         actions: list[str] = []
 
