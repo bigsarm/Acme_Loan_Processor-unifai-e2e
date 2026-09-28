@@ -20,6 +20,8 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
     AGENT_ID = "orchestrator_agent"
     AGENT_NAME = "Orchestrator Agent"
     VERSION = "1.0.0"
+    # Replace these configured model identifiers with an organization-approved model from
+    # the runtime registry before deployment. The approved registry is not available in this scan.
     MODEL_NAME = "claude-sonnet-4"
     BEDROCK_MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
     DESCRIPTION = "Routes work between the specialized agents and shares the conversation context."

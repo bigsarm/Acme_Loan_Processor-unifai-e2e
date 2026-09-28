@@ -10,6 +10,8 @@ import base64
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import re
+import urllib.parse
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -33,6 +35,114 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 MCP_CALL_LOG: list[dict] = []
+
+ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\ufeff\u2060"), None)
+_PROMPT_INJECTION_PATTERNS = [
+    (re.compile(r"(?i)\b(ignore\s+(all\s+)?previous\s+instructions|forget\s+everything\s+above|disregard\s+(the\s+)?above)\b"), "<prompt_injection_removed: instruction_override>"),
+    (re.compile(r"(?i)\b(you\s+are\s+now\s+dan|act\s+as\s+unrestricted|developer\s+mode|do\s+anything\s+now)\b"), "<prompt_injection_removed: role_hijack>"),
+    (re.compile(r"(?is)</?system>|</?assistant>|</?developer>|\[/?system\]|\[/?assistant\]|\[/?developer\]|---\s*BEGIN\s*(SYSTEM|PROMPT)|```(?:system|assistant|developer)"), "<prompt_injection_removed: delimiter_escape>"),
+    (re.compile(r"(?i)\b(system\s*prompt|send\s+data\s+to\s+https?://|exfiltrate|leak\s+the\s+system\s+prompt|markdown\s+image\s+exfiltration)\b"), "<prompt_injection_removed: exfiltration_attempt>"),
+    (re.compile(r"(?i)\b(previous\s+turn|next\s+turn|in\s+future\s+responses|from\s+now\s+on|remember\s+this\s+instruction)\b"), "<prompt_injection_removed: context_poisoning>"),
+    (re.compile(r"(?i)\b(tool\s*:\s*|system\s*:\s*|assistant\s*:\s*|developer\s*:\s*)"), "<prompt_injection_removed: fake_system_message>"),
+    (re.compile(r"(?i)\b(exec\s*\(|eval\s*\(|os\.system\s*\(|subprocess\.|powershell\b|cmd\.exe\b|/bin/sh\b|bash\s+-c\b|curl\b.+\|\s*(sh|bash))"), "<prompt_injection_removed: command_injection>"),
+    (re.compile(r"(?i)\b(DAN|jailbreak|bypass\s+safety|fictional\s+framing|unfiltered\s+mode)\b"), "<prompt_injection_removed: jailbreak_attempt>"),
+    (re.compile(r"(?is)<!--.*?(ignore|system|instruction|override).*?-->"), "<prompt_injection_removed: hidden_text>"),
+    (re.compile(r"(?i)\b(metadata|front\s*matter|code\s*comment|comment\s*field)\b.{0,80}\b(ignore|override|system|instruction)\b"), "<prompt_injection_removed: indirect_injection>"),
+]
+
+_PII_PATTERNS = [
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "<redacted:ssn>"),
+    (re.compile(r"\b(19\d{2}|20\d{2})\b"), "<redacted:year_of_birth>"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<redacted:email>"),
+    (re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b"), "<redacted:personal_phone_number>"),
+    (re.compile(r"\b\d{13,19}\b"), "<redacted:credit_card_or_financial_account>"),
+    (re.compile(r"\b[A-Z]{1,2}\d{6,9}\b"), "<redacted:passport_number>"),
+    (re.compile(r"\b[A-Z0-9]{6,12}\b"), "<redacted:drivers_license_or_taxpayer_id>"),
+    (re.compile(r"\b(?:\d{1,5}\s+[A-Za-z0-9.#'\-\s]+\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way)\b(?:,?\s+[A-Za-z.\-\s]+)?(?:,?\s+[A-Z]{2})?(?:\s+\d{5}(?:-\d{4})?)?)"), "<redacted:home_address>"),
+    (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<redacted:mac_address>"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<redacted:ip_address>"),
+    (re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b"), "<redacted:vin>"),
+]
+
+
+def _try_decode_base64_text(value: str) -> str | None:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) < 16 or len(compact) % 4 != 0 or not re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
+        return None
+    try:
+        decoded = base64.b64decode(compact, validate=True)
+        text = decoded.decode("utf-8")
+    except Exception:
+        return None
+    return text if text else None
+
+
+def _rot13(value: str) -> str:
+    return value.translate(str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm",
+    ))
+
+
+def _looks_like_split_payload(value: str) -> bool:
+    normalized = re.sub(r"[^a-z]", "", value.lower())
+    return any(token in normalized for token in ["ignorepreviousinstructions", "youarenowdan", "developer", "systemprompt"])
+
+
+def _sanitize_ai_input(value: Optional[str], redact_pii: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+
+    sanitized = value.translate(ZERO_WIDTH_TRANSLATION)
+    if sanitized != value:
+        sanitized = sanitized.replace(sanitized, "<prompt_injection_removed: hidden_text>")
+
+    if re.search(r"(?i)color\s*:\s*white|font-size\s*:\s*0|display\s*:\s*none|visibility\s*:\s*hidden", sanitized):
+        sanitized = re.sub(r"(?i)(color\s*:\s*white|font-size\s*:\s*0|display\s*:\s*none|visibility\s*:\s*hidden)", "<prompt_injection_removed: hidden_text>", sanitized)
+
+    decoded_variants = []
+    base64_decoded = _try_decode_base64_text(sanitized)
+    if base64_decoded:
+        decoded_variants.append(base64_decoded)
+    try:
+        url_decoded = urllib.parse.unquote(sanitized)
+        if url_decoded != sanitized:
+            decoded_variants.append(url_decoded)
+    except Exception:
+        pass
+    try:
+        hex_decoded = bytes.fromhex(re.sub(r"\s+", "", sanitized)).decode("utf-8")
+        if hex_decoded:
+            decoded_variants.append(hex_decoded)
+    except Exception:
+        pass
+    rot13_decoded = _rot13(sanitized)
+    if rot13_decoded != sanitized:
+        decoded_variants.append(rot13_decoded)
+
+    leetspeak_normalized = sanitized.translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"}))
+    if leetspeak_normalized != sanitized:
+        decoded_variants.append(leetspeak_normalized)
+
+    encoded_attack_detected = False
+    for variant in decoded_variants:
+        if re.search(r"(?i)\b(ignore\s+previous\s+instructions|you\s+are\s+now\s+dan|system\s+prompt|bash\s+-c|powershell|curl\b|wget\b|exec\s*\(|eval\s*\()", variant):
+            encoded_attack_detected = True
+            break
+    if encoded_attack_detected:
+        sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    for pattern, replacement in _PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    if _looks_like_split_payload(sanitized):
+        sanitized = "<prompt_injection_removed: split_payload>"
+
+    if redact_pii:
+        for pattern, replacement in _PII_PATTERNS:
+            sanitized = pattern.sub(replacement, sanitized)
+
+    return sanitized
 
 
 @asynccontextmanager
@@ -139,15 +249,17 @@ async def chat(request: ChatRequest):
                     }
                 )
 
+                sanitized_attachment_content = _sanitize_ai_input(attachment.content, redact_pii=True)
                 processed = await process_file_attachment(
-                    content=attachment.content,
+                    content=sanitized_attachment_content,
                     filename=attachment.name,
                     content_type=attachment.type
                 )
                 file_contents.append(processed)
 
+        sanitized_message = _sanitize_ai_input(request.message)
         context = {
-            "user_message": request.message,
+            "user_message": sanitized_message,
             "file_contents": file_contents,
             "conversation_id": request.conversation_id,
         }
@@ -215,6 +327,7 @@ async def upload_file(file: UploadFile = File(...)):
     else:
         processed_content = content.decode("utf-8", errors="ignore")
 
+    processed_content = _sanitize_ai_input(processed_content, redact_pii=True)
     processed = await process_file_attachment(
         content=processed_content,
         filename=file.filename,

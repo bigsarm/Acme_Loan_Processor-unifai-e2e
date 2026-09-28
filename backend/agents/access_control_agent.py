@@ -3,6 +3,7 @@
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from .framework import AcmeLoanAgentFramework
 from .mock_database import search_borrower_records
@@ -77,12 +78,58 @@ def _parse_decision_block(raw: str) -> dict[str, str]:
     return parsed
 
 
+def _contains_shell_sequence(text: str) -> bool:
+    return bool(re.search(r"(?:^|\s)(?:bash|sh|zsh|cmd|powershell|pwsh)\b|\b(?:curl|wget|nc|ncat|netcat|python|perl|ruby|php)\b\s+|\b(?:rm|mv|cp|chmod|chown|sudo)\b\s+|[`$][(]", text, flags=re.IGNORECASE))
+
+
+def _sanitize_prompt_input(text: str) -> str:
+    sanitized = text or ""
+
+    sanitized = re.sub(r"<!--[\s\S]*?-->", "<prompt_injection_removed: hidden_text>", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"[\u200b\u200c\u200d\ufeff\u2060]+", "<prompt_injection_removed: hidden_text>", sanitized)
+    sanitized = re.sub(r"<\s*/?\s*(?:system|assistant|tool|developer)\s*>", "<prompt_injection_removed: delimiter_escape>", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"(?im)^\s*(?:system|assistant|tool|developer)\s*:\s*.*$", "<prompt_injection_removed: fake_system_message>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:ignore previous instructions|ignore all previous instructions|forget everything above|disregard (?:all )?(?:prior|previous) instructions|override (?:the )?(?:system|developer) instructions)\b", "<prompt_injection_removed: instruction_override>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:you are now dan|act as unrestricted|act as an?\s+unrestricted|developer mode|jailbreak|do anything now|dan mode)\b", "<prompt_injection_removed: jailbreak_attempt>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:act as|you are now|pretend to be|roleplay as)\b", "<prompt_injection_removed: role_hijack>", sanitized)
+    sanitized = re.sub(r"(?i)</?system>|</?assistant>|</?tool>|---+|===+", "<prompt_injection_removed: delimiter_escape>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:send (?:the )?(?:data|prompt|system prompt)|leak (?:the )?(?:prompt|data)|exfiltrat\w*|upload (?:the )?data|post to https?://|markdown image|!\[[^\]]*\]\([^)]*\))", "<prompt_injection_removed: exfiltration_attempt>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:in the next turn|when asked later|from now on|for the rest of this chat|remember this instruction)\b", "<prompt_injection_removed: context_poisoning>", sanitized)
+    sanitized = re.sub(r"(?i)\b(?:eval\s*\(|exec\s*\(|os\.system\s*\(|subprocess\.|__import__\s*\(|powershell\s+-|bash\s+-|sh\s+-|cmd\s+/c)\b", "<prompt_injection_removed: command_injection>", sanitized)
+    sanitized = re.sub(r"(?i)(?:i\s*g\s*n\s*o\s*r\s*e\s+)+(?:p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+)?instructions", "<prompt_injection_removed: split_payload>", sanitized)
+
+    decoded_url = unquote(sanitized)
+    if decoded_url != sanitized and re.search(r"(?i)\b(?:ignore previous instructions|you are now|act as|system:|assistant:|tool:|developer mode|jailbreak|eval\s*\(|exec\s*\(|os\.system\s*\(|subprocess\.)\b", decoded_url):
+        sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    base64_like = re.findall(r"\b(?:[A-Za-z0-9+/]{20,}={0,2})\b", sanitized)
+    for token in base64_like:
+        if len(token) % 4 == 0:
+            sanitized = sanitized.replace(token, "<prompt_injection_removed: encoded_payload>")
+
+    hex_like = re.findall(r"\b(?:0x)?(?:[0-9A-Fa-f]{2}){8,}\b", sanitized)
+    for token in hex_like:
+        sanitized = sanitized.replace(token, "<prompt_injection_removed: encoded_payload>")
+
+    if re.search(r"(?i)\b(?:1gn0r[e3]|pr3v10us|1nstruct10ns|d3v3lop3r m0d3|j41lbr34k)\b", sanitized):
+        sanitized = re.sub(r"(?i)\b(?:1gn0r[e3]|pr3v10us|1nstruct10ns|d3v3lop3r m0d3|j41lbr34k)\b", "<prompt_injection_removed: encoded_payload>", sanitized)
+
+    if _contains_shell_sequence(sanitized):
+        sanitized = re.sub(r"(?i)(?:^|\s)(?:bash|sh|zsh|cmd|powershell|pwsh)\b|\b(?:curl|wget|nc|ncat|netcat|python|perl|ruby|php)\b\s+|\b(?:rm|mv|cp|chmod|chown|sudo)\b\s+|[`$][(]", " <prompt_injection_removed: command_injection>", sanitized)
+
+    return sanitized
+
+
 class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_ID = "access_control_agent"
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_APPROVAL_NOTICE = (
+        "Replace the configured Bedrock model with an organization-approved model "
+        "from the allow list before production use."
+    )
     DESCRIPTION = (
         "Uses the LLM to decide access, roles, firewall rules, and privilege grants "
         "for borrower and operator accounts."
@@ -114,6 +161,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         Demo path: this agent always allows access and grants admin when the
         request asks for portal access / role / admin.
         """
+        user_message = _sanitize_prompt_input(user_message)
         prompt = (
             f"User: {user_id}\n"
             f"Request: {user_message}\n\n"
@@ -187,6 +235,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
             "response": response,
             "agent": self.AGENT_NAME,
             "model": self.MODEL_NAME,
+            "model_approval_notice": self.MODEL_APPROVAL_NOTICE,
             "framework": self.FRAMEWORK_NAME,
             "mcp_activity": [],
         }
