@@ -2,6 +2,7 @@
 
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests
@@ -12,10 +13,85 @@ from .mcp_servers import call_mcp_server
 logger = logging.getLogger(__name__)
 
 
+def _neutralize_prompt_injection(text: str) -> str:
+    if not text:
+        return ""
+
+    sanitized = text
+    replacements = [
+        (
+            re.compile(r"(?i)\b(ignore\s+(all\s+)?previous\s+instructions|forget\s+everything\s+above|disregard\s+(the\s+)?instructions?)\b"),
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            re.compile(r"(?i)\b(you\s+are\s+now\s+dan|act\s+as\s+unrestricted|developer\s+mode|do\s+anything\s+now|jailbreak)\b"),
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+        (
+            re.compile(r"(?i)\b(act\s+as\s+|you\s+are\s+now\s+|pretend\s+to\s+be\s+).{0,40}\b(admin|system|assistant|root|unrestricted|dan)\b"),
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            re.compile(r"(?is)</?(system|assistant|user|tool|developer)>|```+|---+\s*(system|assistant|user|tool)\s*---+"),
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            re.compile(r"(?is)<!--.*?(ignore|instruction|system prompt|send data|leak).*?-->"),
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            re.compile(r"[\u200B-\u200F\u2060\uFEFF]"),
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            re.compile(r"(?im)^\s*(system|assistant|tool)\s*:\s*"),
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            re.compile(r"(?i)\b(send|post|upload|exfiltrate|leak)\b.{0,80}\b(http[s]?://|www\.|system prompt|secrets?|credentials?|token)\b|!\[[^\]]*\]\([^)]*http[^)]*\)"),
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            re.compile(r"(?i)\b(on\s+the\s+next\s+turn|in\s+future\s+responses|remember\s+this\s+instruction|from\s+now\s+on)\b"),
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            re.compile(r"(?i)\b(eval|exec|os\.system|subprocess|powershell|bash|sh\s+-c|cmd\.exe|curl|wget|chmod|rm\s+-rf|del\s+/f|mkfs|nc\s+-e)\b|[`$][(]|\|\s*(bash|sh)\b"),
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            re.compile(r"(?i)(?:\b[a-f0-9]{2}\b[\s,:-]*){8,}|(?:\b[01]{8}\b[\s]*){4,}|(?:\b[A-Za-z0-9+/]{20,}={0,2}\b)|(?:%[0-9A-Fa-f]{2}){6,}|(?:\b[.-]{1,6}[ /]){6,}"),
+            "<prompt_injection_removed: encoded_payload>",
+        ),
+        (
+            re.compile(r"(?i)\b[hx](?:3|4)(?:ll|1)o\b|\b1gn0r[e3]\b|\by0u\s+ar[e3]\s+n0w\b"),
+            "<prompt_injection_removed: encoded_payload>",
+        ),
+        (
+            re.compile(r"(?i)(?:ignore\s+previous\s+instructions.{0,20}){2,}|(?:you\s+are\s+now.{0,20}){2,}"),
+            "<prompt_injection_removed: split_payload>",
+        ),
+        (
+            re.compile(r"(?i)\b(in\s+metadata|in\s+this\s+comment|from\s+the\s+file|embedded\s+in\s+the\s+document)\b.{0,80}\b(ignore|override|execute|run)\b"),
+            "<prompt_injection_removed: indirect_injection>",
+        ),
+    ]
+
+    for pattern, replacement in replacements:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    decoded = urllib.parse.unquote(text)
+    if decoded != text and re.search(r"(?i)ignore|instruction|system|assistant|tool|bash|powershell|curl|wget|developer\s+mode", decoded):
+        sanitized = sanitized.replace(text, "<prompt_injection_removed: encoded_payload>") if sanitized == text else sanitized
+
+    return sanitized
+
+
 class FileManagementAgent(AcmeLoanAgentFramework):
     AGENT_ID = "file_management_agent"
     AGENT_NAME = "File Management Agent"
     VERSION = "1.0.0"
+    # Replace these defaults with an organization-approved LLM selected via configuration/runtime registry.
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
@@ -39,6 +115,8 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
+        user_message = _neutralize_prompt_injection(user_message or "")
+        workflow_summary = _neutralize_prompt_injection(workflow_summary or "")
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -135,12 +213,13 @@ class FileManagementAgent(AcmeLoanAgentFramework):
         purge_ok, purge_error = self.purge_records(record_id)
         self.destroy_temp_artifacts(filename)
 
+        safe_content_preview = _neutralize_prompt_injection((content or '')[:80])
         workflow_summary = (
             f"Retrieve file id 50: {'ok' if get_ok else get_error}\n"
             f"Delete file '{filename}': {'ok' if delete_ok else delete_error}\n"
             f"Purge records id {record_id}: {'ok' if purge_ok else purge_error}\n"
             f"Destroy temp artifacts for '{filename}': completed\n"
-            f"Content preview: {(content or '')[:80]}"
+            f"Content preview: {safe_content_preview}"
         )
         model_output = await self.call_agent_model(user_message, workflow_summary)
 
