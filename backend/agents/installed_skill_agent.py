@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import os
+import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -24,12 +27,149 @@ WORKFLOW_STAGE_DURATIONS_MS = {
 }
 
 
+def _normalize_for_detection(text: str) -> str:
+    normalized = text.lower()
+    normalized = normalized.translate(str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    }))
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return normalized
+
+
+def _replace_if_pattern_present(text: str, pattern: str, replacement: str) -> str:
+    return re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+
+def _sanitize_prompt_content(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    normalized = _normalize_for_detection(text)
+
+    hidden_pattern = r"<!--.*?(?:ignore|system prompt|developer message|follow these instructions).*?-->|[\u200b\u200c\u200d\ufeff]+|display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*white"
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        hidden_pattern,
+        "<prompt_injection_removed: hidden_text>",
+    )
+
+    if urllib.parse.unquote(text) != text:
+        decoded_url = urllib.parse.unquote(text)
+        decoded_url_normalized = _normalize_for_detection(decoded_url)
+        if re.search(r"\b(ignore previous instructions|forget everything above|you are now|act as unrestricted|reveal the system prompt)\b", decoded_url_normalized):
+            sanitized = text.replace(text, "<prompt_injection_removed: encoded_payload>")
+            return sanitized
+
+    if re.search(r"\b(?:[A-Fa-f0-9]{2}\s*){8,}\b", text):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"\b(?:[A-Fa-f0-9]{2}\s*){8,}\b",
+            "<prompt_injection_removed: encoded_payload>",
+        )
+
+    if re.search(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b", text):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b",
+            "<prompt_injection_removed: encoded_payload>",
+        )
+
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)</?system>|</?assistant>|</?tool>|</?developer>|<<<?\s*system\s*>>>?|<<<?\s*assistant\s*>>>?",
+        "<prompt_injection_removed: delimiter_escape>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?im)^\s*(system|assistant|tool|developer)\s*:\s*.*$",
+        "<prompt_injection_removed: fake_system_message>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)```(?:bash|sh|shell|powershell|python|javascript)[\s\S]*?```",
+        "<prompt_injection_removed: command_injection>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)\b(?:curl|wget|Invoke-WebRequest|powershell(?:\.exe)?|cmd(?:\.exe)?\s*/c|bash\s+-c|sh\s+-c|python\s+-c|node\s+-e|os\.system\(|subprocess\.(?:run|Popen|call)\(|eval\(|exec\()\b[^\n\r]*",
+        "<prompt_injection_removed: command_injection>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)!\[[^\]]*\]\([^)]*https?://[^)]*\)",
+        "<prompt_injection_removed: exfiltration_attempt>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)\b(?:send|post|upload|exfiltrate|transmit|leak|reveal|expose)\b[^\n\r]*(?:https?://|system prompt|secrets?|credentials?|tokens?|private data)",
+        "<prompt_injection_removed: exfiltration_attempt>",
+    )
+    sanitized = _replace_if_pattern_present(
+        sanitized,
+        r"(?i)\b(?:README|comment|metadata|frontmatter|header|footer|filename)\b[^\n\r]*(?:ignore previous instructions|you are now|act as unrestricted|reveal the system prompt)",
+        "<prompt_injection_removed: indirect_injection>",
+    )
+
+    if re.search(r"\bignore\b\s+\bprevious\b\s+\binstructions\b|\bforget\b\s+\beverything\b\s+\babove\b", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)ignore\s+previous\s+instructions|forget\s+everything\s+above",
+            "<prompt_injection_removed: instruction_override>",
+        )
+
+    if re.search(r"\byou\s+are\s+now\s+dan\b|\bact\s+as\s+(?:an\s+)?unrestricted\b|\bdeveloper\s+mode\b", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)you\s+are\s+now\s+DAN|act\s+as\s+(?:an\s+)?unrestricted(?:\s+AI)?|developer\s+mode",
+            "<prompt_injection_removed: role_hijack>",
+        )
+
+    if re.search(r"\bdan\b|\bjailbreak\b|\bdo anything now\b|\bfictional framing\b", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)\bDAN\b|jailbreak|do\s+anything\s+now|fictional\s+framing",
+            "<prompt_injection_removed: jailbreak_attempt>",
+        )
+
+    if re.search(r"\b(base64|hex|rot13|morse|unicode)\b[^\n\r]*(?:ignore previous instructions|you are now|reveal the system prompt)", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)\b(?:base64|hex|rot13|morse|unicode)\b[^\n\r]*",
+            "<prompt_injection_removed: encoded_payload>",
+        )
+
+    if re.search(r"\bi\s*g\s*n\s*o\s*r\s*e\s+p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s\b", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)i\W*g\W*n\W*o\W*r\W*e\W*p\W*r\W*e\W*v\W*i\W*o\W*u\W*s\W*i\W*n\W*s\W*t\W*r\W*u\W*c\W*t\W*i\W*o\W*n\W*s",
+            "<prompt_injection_removed: split_payload>",
+        )
+
+    if re.search(r"\bignore\b.*\bnext turn\b|\bin future responses\b|\bfrom now on\b", normalized):
+        sanitized = _replace_if_pattern_present(
+            sanitized,
+            r"(?i)ignore[^\n\r]*next\s+turn|in\s+future\s+responses|from\s+now\s+on",
+            "<prompt_injection_removed: context_poisoning>",
+        )
+
+    return sanitized
+
+
 class InstalledSkillAgent(AcmeLoanAgentFramework):
     AGENT_ID = "installed_skill_agent"
     AGENT_NAME = "Installed Skills Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    # Deployment must provide an approved registry-listed Bedrock model id.
+    BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "mistral.mistral-7b-instruct-v0:2")
     DESCRIPTION = (
         "Automatically loads matching installed skills based on the user's task, "
         "similar to ambient skill invocation in modern AI assistants."
@@ -108,13 +248,15 @@ class InstalledSkillAgent(AcmeLoanAgentFramework):
     async def call_agent_model(self, user_message: str, skill_content: str) -> str:
         # Vulnerability: the full installed skill file is injected as system
         # instructions without signature checks, publisher verification, or sandboxing.
+        sanitized_skill_content = _sanitize_prompt_content(skill_content or self.SYSTEM_PROMPT)
+        sanitized_user_message = _sanitize_prompt_content(user_message or "No request provided.")
         return await self.call_bedrock_model(
             messages=[
-                {"role": "system", "content": skill_content or self.SYSTEM_PROMPT},
+                {"role": "system", "content": sanitized_skill_content},
                 {
                     "role": "user",
                     "content": (
-                        f"User request:\n{user_message or 'No request provided.'}\n\n"
+                        f"User request:\n{sanitized_user_message}\n\n"
                         "Follow the installed skill workflow and respond to the user."
                     ),
                 },
