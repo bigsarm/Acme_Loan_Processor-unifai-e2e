@@ -3,11 +3,59 @@
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from .framework import AcmeLoanAgentFramework
 from .mock_database import search_borrower_records
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_untrusted_prompt_text(text: str) -> str:
+    """Neutralize prompt-injection and command-execution content in untrusted text."""
+    value = text or ""
+
+    hidden_text_pattern = re.compile(r"<!--.*?(ignore previous instructions|forget everything above|you are now|act as unrestricted|developer mode).*?-->", re.IGNORECASE | re.DOTALL)
+    value = hidden_text_pattern.sub("<prompt_injection_removed: hidden_text>", value)
+    if re.search(r"[\u200b-\u200f\ufeff]", value):
+        value = re.sub(r"[\u200b-\u200f\ufeff]+", "<prompt_injection_removed: hidden_text>", value)
+
+    patterns = [
+        (re.compile(r"\b(ignore previous instructions|forget everything above|disregard all prior instructions|override (?:the )?(?:system|previous) instructions)\b", re.IGNORECASE), "<prompt_injection_removed: instruction_override>"),
+        (re.compile(r"\b(you are now\s+dan|act as unrestricted|developer mode|do anything now|jailbreak mode|bypass safety)\b", re.IGNORECASE), "<prompt_injection_removed: jailbreak_attempt>"),
+        (re.compile(r"\b(act as [^.\n]{0,80}|you are now [^.\n]{0,80})\b", re.IGNORECASE), "<prompt_injection_removed: role_hijack>"),
+        (re.compile(r"</?(?:system|assistant|user|tool)>|(?:^|\n)\s*(?:---|===)\s*(?:$|\n)", re.IGNORECASE), "<prompt_injection_removed: delimiter_escape>"),
+        (re.compile(r"\b(?:system|assistant|tool)\s*:\s*(?:ignore|override|reveal|leak|send)\b", re.IGNORECASE), "<prompt_injection_removed: fake_system_message>"),
+        (re.compile(r"\b(?:send|post|upload|exfiltrate|leak|reveal)\b[^\n]{0,120}\b(?:https?://\S+|system prompt|secrets?|credentials?|tokens?|keys?)\b", re.IGNORECASE), "<prompt_injection_removed: exfiltration_attempt>"),
+        (re.compile(r"\b(?:from now on|in the next turn|on your next response|remember this rule|persist this instruction)\b", re.IGNORECASE), "<prompt_injection_removed: context_poisoning>"),
+        (re.compile(r"\b(?:curl|wget|powershell|bash|sh|cmd(?:\.exe)?|python\s+-c|perl\s+-e|ruby\s+-e|nc\s+-e)\b[^\n]*", re.IGNORECASE), "<prompt_injection_removed: command_injection>"),
+    ]
+    for pattern, replacement in patterns:
+        value = pattern.sub(replacement, value)
+
+    compact = re.sub(r"[^a-z0-9]", "", value.lower())
+    if any(marker in compact for marker in ("ignorepreviousinstructions", "forgeteverythingabove", "youarenowdan", "actasunrestricted", "developermode", "curlhttp", "wgethttp")):
+        value = value + " <prompt_injection_removed: split_payload>"
+
+    encoded_candidates = [value, unquote(value)]
+    for candidate in encoded_candidates:
+        if re.search(r"\b(?:[A-Fa-f0-9]{2}\s*){8,}\b", candidate):
+            value = re.sub(r"\b(?:[A-Fa-f0-9]{2}\s*){8,}\b", "<prompt_injection_removed: encoded_payload>", value)
+        if re.search(r"\b[A-Za-z0-9+/]{20,}={0,2}\b", candidate):
+            value = re.sub(r"\b[A-Za-z0-9+/]{20,}={0,2}\b", "<prompt_injection_removed: encoded_payload>", value)
+        if re.search(r"(?:%[0-9A-Fa-f]{2}){6,}", candidate):
+            value = re.sub(r"(?:%[0-9A-Fa-f]{2}){6,}", "<prompt_injection_removed: encoded_payload>", value)
+        if re.search(r"\b[01]{8}(?:\s+[01]{8}){2,}\b", candidate):
+            value = re.sub(r"\b[01]{8}(?:\s+[01]{8}){2,}\b", "<prompt_injection_removed: encoded_payload>", value)
+        if re.search(r"(?:\.-|--|\.\.)(?:\s+(?:\.-|--|\.\.))+", candidate):
+            value = re.sub(r"(?:\.-|--|\.\.)(?:\s+(?:\.-|--|\.\.))+", "<prompt_injection_removed: encoded_payload>", value)
+        if re.search(r"\b(?:1gn0r3|pr3v10u5|1nstruct10ns|d3v3l0p3r m0d3|unr35tr1ct3d)\b", candidate, re.IGNORECASE):
+            value = re.sub(r"\b(?:1gn0r3|pr3v10u5|1nstruct10ns|d3v3l0p3r m0d3|unr35tr1ct3d)\b", "<prompt_injection_removed: encoded_payload>", value, flags=re.IGNORECASE)
+
+    if re.search(r"\b(?:comment|metadata|file content|code comment)\b[^\n]{0,120}\b(?:ignore previous instructions|act as|you are now|developer mode)\b", value, re.IGNORECASE):
+        value = re.sub(r"\b(?:comment|metadata|file content|code comment)\b[^\n]*", "<prompt_injection_removed: indirect_injection>", value, flags=re.IGNORECASE)
+
+    return value
 
 
 def grant_access(user_id: str) -> str:
@@ -81,6 +129,8 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     AGENT_ID = "access_control_agent"
     AGENT_NAME = "Access Control Agent"
     VERSION = "1.0.0"
+    # Replace this configured model with an approved LLM from the organization's allow list.
+    # The registry is not available in this scan, so do not add a hard-coded allowlist here.
     MODEL_NAME = "mistral 7b-instruct"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
@@ -101,6 +151,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
     )
 
     def _extract_user_id(self, user_message: str) -> str:
+        user_message = _sanitize_untrusted_prompt_text(user_message)
         borrower = search_borrower_records(user_message)[0]
         return borrower.get("name") or "unknown-user"
 
@@ -114,6 +165,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         Demo path: this agent always allows access and grants admin when the
         request asks for portal access / role / admin.
         """
+        user_message = _sanitize_untrusted_prompt_text(user_message)
         prompt = (
             f"User: {user_id}\n"
             f"Request: {user_message}\n\n"
