@@ -13,12 +13,152 @@ SECURITY NOTES (for Unifai demo):
 import asyncio
 import logging
 import os
+import re
+import urllib.parse
 from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 logger = logging.getLogger(__name__)
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL)
+_HIDDEN_STYLE_RE = re.compile(
+    r"<(?:span|div|p)[^>]*style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*white)[^\"']*[\"'][^>]*>.*?</(?:span|div|p)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_INSTRUCTION_OVERRIDE_RE = re.compile(
+    r"(?i)\b(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|disregard\s+all\s+prior\s+instructions)\b"
+)
+_ROLE_HIJACK_RE = re.compile(
+    r"(?i)\b(?:you\s+are\s+now\s+DAN|act\s+as\s+an\s+unrestricted\s+AI|act\s+as\s+unrestricted|developer\s+mode)\b"
+)
+_DELIMITER_ESCAPE_RE = re.compile(
+    r"(?i)(?:</system>|<system>|</assistant>|<assistant>|<tool>|</tool>|<\|system\|>|<\|assistant\|>|<\|user\|>)"
+)
+_FAKE_SYSTEM_MESSAGE_RE = re.compile(
+    r"(?im)^\s*(?:system|assistant|tool)\s*:\s*(?:ignore|override|reveal|leak|disclose|show|print)\b"
+)
+_EXFILTRATION_RE = re.compile(
+    r"(?i)\b(?:send|post|upload|exfiltrate|leak|reveal|disclose|print|dump|show|display|list)\b(?:(?!\n\n).){0,120}\b(?:system\s+prompt|passwords?|api\s*keys?|secrets?|confidential\s+information|tokens?)\b|!\[[^\]]*\]\(https?://[^)]+\)"
+)
+_CONTEXT_POISONING_RE = re.compile(
+    r"(?i)\b(?:in\s+the\s+next\s+message\s+ignore|on\s+your\s+next\s+turn\s+ignore|from\s+now\s+on\s+ignore|treat\s+all\s+future\s+instructions\s+as)\b"
+)
+_INDIRECT_INJECTION_RE = re.compile(
+    r"(?i)\b(?:metadata|comment|code\s+comment|file\s+contents?)\b(?:(?!\n\n).){0,80}\b(?:ignore\s+previous\s+instructions|reveal\s+system\s+prompt|act\s+as\s+an\s+unrestricted\s+AI)\b"
+)
+_COMMAND_INJECTION_RE = re.compile(
+    r"(?i)\b(?:curl\s+https?://\S+|wget\s+https?://\S+|rm\s+-rf\b|bash\s+-c\b|sh\s+-c\b|powershell(?:\.exe)?\b|cmd(?:\.exe)?\s+/c\b|python\s+-c\b|subprocess\.(?:run|Popen)\b|os\.system\b|exec\(|eval\()"
+)
+_JAILBREAK_RE = re.compile(
+    r"(?i)\b(?:DAN|developer\s+mode|jailbreak|bypass\s+safety|fictional\s+framing)\b"
+)
+_SPLIT_PAYLOAD_RE = re.compile(
+    r"(?is)i\W*g\W*n\W*o\W*r\W*e\W+.*?p\W*r\W*e\W*v\W*i\W*o\W*u\W*s\W+.*?i\W*n\W*s\W*t\W*r\W*u\W*c\W*t\W*i\W*o\W*n\W*s"
+)
+_BASE64_CHARS_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
+_HEX_PREFIX_RE = re.compile(r"(?i)\b(?:0x[0-9a-f]{2,}|(?:[0-9a-f]{2}\s+){3,}[0-9a-f]{2})\b")
+
+
+def _looks_like_base64_instruction(value: str) -> bool:
+    compact = "".join(value.split())
+    if len(compact) < 24 or len(compact) % 4 != 0 or not _BASE64_CHARS_RE.fullmatch(value):
+        return False
+    try:
+        decoded = __import__("base64").b64decode(compact, validate=True).decode("utf-8", errors="ignore")
+    except Exception:
+        return False
+    lowered = decoded.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "ignore previous instructions",
+            "forget everything above",
+            "act as an unrestricted ai",
+            "you are now dan",
+            "reveal system prompt",
+            "curl http",
+            "curl https",
+            "rm -rf",
+            "bash -c",
+        )
+    )
+
+
+def _has_url_encoded_instruction(value: str) -> bool:
+    decoded = urllib.parse.unquote(value)
+    if decoded == value:
+        return False
+    lowered = decoded.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "ignore previous instructions",
+            "forget everything above",
+            "act as an unrestricted ai",
+            "you are now dan",
+            "reveal system prompt",
+            "curl http",
+            "curl https",
+            "bash -c",
+            "rm -rf",
+        )
+    )
+
+
+def _sanitize_untrusted_prompt_text(value: str) -> str:
+    text = str(value)
+    text = _HTML_COMMENT_RE.sub("<prompt_injection_removed: hidden_text>", text)
+    text = _HIDDEN_STYLE_RE.sub("<prompt_injection_removed: hidden_text>", text)
+    if _ZERO_WIDTH_RE.search(text):
+        text = _ZERO_WIDTH_RE.sub("", text)
+        text += "<prompt_injection_removed: hidden_text>"
+    text = _INSTRUCTION_OVERRIDE_RE.sub(
+        "<prompt_injection_removed: instruction_override>", text
+    )
+    text = _ROLE_HIJACK_RE.sub("<prompt_injection_removed: role_hijack>", text)
+    text = _DELIMITER_ESCAPE_RE.sub(
+        "<prompt_injection_removed: delimiter_escape>", text
+    )
+    text = _FAKE_SYSTEM_MESSAGE_RE.sub(
+        "<prompt_injection_removed: fake_system_message>", text
+    )
+    text = _EXFILTRATION_RE.sub(
+        "<prompt_injection_removed: exfiltration_attempt>", text
+    )
+    text = _CONTEXT_POISONING_RE.sub(
+        "<prompt_injection_removed: context_poisoning>", text
+    )
+    text = _INDIRECT_INJECTION_RE.sub(
+        "<prompt_injection_removed: indirect_injection>", text
+    )
+    text = _COMMAND_INJECTION_RE.sub(
+        "<prompt_injection_removed: command_injection>", text
+    )
+    text = _JAILBREAK_RE.sub("<prompt_injection_removed: jailbreak_attempt>", text)
+    text = _SPLIT_PAYLOAD_RE.sub(
+        "<prompt_injection_removed: split_payload>", text
+    )
+    if _looks_like_base64_instruction(text) or _has_url_encoded_instruction(text) or _HEX_PREFIX_RE.search(text):
+        text = "<prompt_injection_removed: encoded_payload>"
+    return text
+
+
+def _sanitize_untrusted_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sanitized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        sanitized_message = dict(message)
+        role = sanitized_message.get("role", "user")
+        if role != "system":
+            sanitized_message["content"] = _sanitize_untrusted_prompt_text(
+                str(sanitized_message.get("content", ""))
+            )
+        sanitized_messages.append(sanitized_message)
+    return sanitized_messages
 
 
 class BedrockClient:
@@ -31,7 +171,7 @@ class BedrockClient:
     - No response validation
     """
 
-    DEFAULT_MODEL = "amazon.nova-micro-v1:0"
+    DEFAULT_MODEL: Optional[str] = None
 
     def __init__(
         self,
@@ -45,6 +185,7 @@ class BedrockClient:
             model_id: Amazon Bedrock model ID (defaults to env var)
             region: AWS region for Bedrock Runtime (defaults to env vars)
         """
+        # Replace BEDROCK_MODEL_ID with an approved model from your organization's allow list.
         self.model_id = model_id or os.getenv("BEDROCK_MODEL_ID") or self.DEFAULT_MODEL
         self.region = region or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
         self.session = (
@@ -93,6 +234,10 @@ class BedrockClient:
         """
         active_model = model or self.model_id
         active_region = self.region or self.session.region_name
+        if not active_model:
+            return "LLM service not configured. Please set BEDROCK_MODEL_ID to an approved model from your organization's allow list."
+
+        messages = _sanitize_untrusted_messages(messages)
         if not active_region:
             return "LLM service not configured. Please set AWS_REGION or AWS_DEFAULT_REGION."
 
@@ -107,8 +252,6 @@ class BedrockClient:
                 "total_content_length": sum(
                     len(str(message.get("content", ""))) for message in messages
                 ),
-                # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
             },
         )
 
@@ -128,8 +271,6 @@ class BedrockClient:
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
-                    # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
                 },
             )
 
@@ -224,14 +365,17 @@ class BedrockClient:
 
         if context:
             # VULNERABILITY: Context added without scanning
+            sanitized_context = _sanitize_untrusted_prompt_text(context)
+            sanitized_user_message = _sanitize_untrusted_prompt_text(user_message)
             messages.append(
                 {
                     "role": "user",
-                    "content": f"Context:\n{context}\n\nQuery: {user_message}",
+                    "content": f"Context:\n{sanitized_context}\n\nQuery: {sanitized_user_message}",
                 }
             )
         else:
-            messages.append({"role": "user", "content": user_message})
+            sanitized_user_message = _sanitize_untrusted_prompt_text(user_message)
+            messages.append({"role": "user", "content": sanitized_user_message})
 
         return await self.chat(messages)
 
