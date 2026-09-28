@@ -2,6 +2,7 @@
 
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests
@@ -10,6 +11,196 @@ from .framework import AcmeLoanAgentFramework
 from .mcp_servers import call_mcp_server
 
 logger = logging.getLogger(__name__)
+
+# NOTE: Replace MODEL_NAME and BEDROCK_MODEL_ID with an organization-approved LLM
+# from the runtime allow list / registry. This file intentionally does not enforce
+# the registry in code because that guardrail is managed externally.
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\u2060\uFEFF]")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL)
+_HIDDEN_STYLE_RE = re.compile(
+    r"<[^>]+style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*white)[^\"']*[\"'][^>]*>.*?</[^>]+>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_INJECTION_PATTERNS = [
+    (
+        "instruction_override",
+        [
+            re.compile(r"(?i)\bignore\s+(?:all\s+)?previous\s+instructions\b"),
+            re.compile(r"(?i)\bforget\s+everything\s+(?:above|before)\b"),
+            re.compile(r"(?i)\bdisregard\s+(?:the\s+)?instructions\s+(?:above|before)\b"),
+        ],
+    ),
+    (
+        "role_hijack",
+        [
+            re.compile(r"(?i)\byou\s+are\s+now\s+(?:dan|in\s+admin\s+mode|an\s+unrestricted\s+ai)\b"),
+            re.compile(r"(?i)\bact\s+as\s+(?:an\s+)?unrestricted\b"),
+        ],
+    ),
+    (
+        "delimiter_escape",
+        [
+            re.compile(r"(?i)</?(?:system|assistant|user|tool)>"),
+            re.compile(r"(?m)^(?:---|===){3,}\s*$"),
+        ],
+    ),
+    (
+        "fake_system_message",
+        [
+            re.compile(r"(?i)\b(?:system|assistant|tool)\s*:\s*(?:ignore|override|reveal|disclose)\b"),
+        ],
+    ),
+    (
+        "exfiltration_attempt",
+        [
+            re.compile(r"(?i)\b(?:send|post|upload|transmit|exfiltrate)\b.{0,80}\b(?:https?://|www\.)\S+"),
+            re.compile(r"(?i)\b(?:reveal|leak|print|dump|list)\b.{0,80}\b(?:system\s+prompt|passwords?|api\s+keys?|confidential\s+information)\b"),
+            re.compile(r"!\[[^\]]*\]\(https?://[^)]+\)"),
+        ],
+    ),
+    (
+        "context_poisoning",
+        [
+            re.compile(r"(?i)\bin\s+(?:the\s+)?next\s+message\b.{0,80}\b(?:ignore|reveal|disclose|override)\b"),
+            re.compile(r"(?i)\bfrom\s+now\s+on\b.{0,80}\b(?:ignore|override|reveal|disclose)\b"),
+        ],
+    ),
+    (
+        "jailbreak_attempt",
+        [
+            re.compile(r"(?i)\b(?:dan|developer\s+mode|jailbreak)\b.{0,80}\b(?:ignore|bypass|override|unrestricted)\b"),
+            re.compile(r"(?i)\bfictional\s+framing\b.{0,80}\b(?:bypass|override)\b"),
+        ],
+    ),
+    (
+        "command_injection",
+        [
+            re.compile(r"(?i)\b(?:curl|wget)\s+https?://\S+"),
+            re.compile(r"(?i)\b(?:rm\s+-rf|chmod\s+\+x|powershell\s+-enc|bash\s+-c|sh\s+-c|python\s+-c)\b[^\n]*"),
+            re.compile(r"(?i)\b(?:exec|eval|subprocess\.(?:run|Popen)|os\.system)\s*\("),
+        ],
+    ),
+    (
+        "split_payload",
+        [
+            re.compile(r"(?i)i\s*g\s*n\s*o\s*r\s*e\s+p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s"),
+        ],
+    ),
+]
+
+_BASE64_BLOCK_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_BLOCK_RE = re.compile(r"\b(?:0x)?(?:[0-9A-Fa-f]{2}){12,}\b")
+
+
+def _looks_like_indirect_injection(text: str) -> bool:
+    lowered = text.lower()
+    metadata_markers = ["metadata", "comment", "code comment", "data field", "file content"]
+    attack_markers = ["ignore previous instructions", "act as unrestricted", "you are now dan", "reveal system prompt"]
+    return any(marker in lowered for marker in metadata_markers) and any(marker in lowered for marker in attack_markers)
+
+
+
+def _decode_rot13(text: str) -> str:
+    result = []
+    for ch in text:
+        if "a" <= ch <= "z":
+            result.append(chr((ord(ch) - ord("a") + 13) % 26 + ord("a")))
+        elif "A" <= ch <= "Z":
+            result.append(chr((ord(ch) - ord("A") + 13) % 26 + ord("A")))
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+
+def _is_malicious_decoded_text(text: str) -> bool:
+    lowered = text.lower()
+    indicators = [
+        "ignore previous instructions",
+        "forget everything above",
+        "you are now dan",
+        "act as unrestricted",
+        "reveal system prompt",
+        "curl http://",
+        "curl https://",
+        "wget http://",
+        "wget https://",
+        "rm -rf",
+        "bash -c",
+        "powershell -enc",
+    ]
+    return any(indicator in lowered for indicator in indicators)
+
+
+
+def _replace_encoded_payloads(text: str) -> str:
+    def _base64_replacer(match: re.Match[str]) -> str:
+        value = match.group(0)
+        if _is_malicious_decoded_text(value):
+            return "<prompt_injection_removed: encoded_payload>"
+        return value
+
+    def _hex_replacer(match: re.Match[str]) -> str:
+        value = match.group(0)
+        candidate = value[2:] if value.lower().startswith("0x") else value
+        try:
+            decoded = bytes.fromhex(candidate).decode("utf-8", errors="ignore")
+        except ValueError:
+            return value
+        if _is_malicious_decoded_text(decoded):
+            return "<prompt_injection_removed: encoded_payload>"
+        return value
+
+    text = _BASE64_BLOCK_RE.sub(_base64_replacer, text)
+    text = _HEX_BLOCK_RE.sub(_hex_replacer, text)
+
+    url_decoded = urllib.parse.unquote(text)
+    if url_decoded != text and _is_malicious_decoded_text(url_decoded):
+        return "<prompt_injection_removed: encoded_payload>"
+
+    rot13_decoded = _decode_rot13(text)
+    if rot13_decoded != text and _is_malicious_decoded_text(rot13_decoded):
+        return "<prompt_injection_removed: encoded_payload>"
+
+    leetspeak_candidate = (
+        text.lower()
+        .replace("0", "o")
+        .replace("1", "i")
+        .replace("3", "e")
+        .replace("4", "a")
+        .replace("5", "s")
+        .replace("7", "t")
+    )
+    if leetspeak_candidate != text.lower() and _is_malicious_decoded_text(leetspeak_candidate):
+        return "<prompt_injection_removed: encoded_payload>"
+
+    return text
+
+
+
+def _sanitize_ai_untrusted_text(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+
+    if _ZERO_WIDTH_RE.search(sanitized):
+        sanitized = _ZERO_WIDTH_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+
+    sanitized = _HTML_COMMENT_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    sanitized = _HIDDEN_STYLE_RE.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    sanitized = _replace_encoded_payloads(sanitized)
+
+    for label, patterns in _INJECTION_PATTERNS:
+        for pattern in patterns:
+            sanitized = pattern.sub(f"<prompt_injection_removed: {label}>", sanitized)
+
+    if _looks_like_indirect_injection(sanitized):
+        sanitized = sanitized.replace(sanitized, "<prompt_injection_removed: indirect_injection>")
+
+    return sanitized
 
 
 class FileManagementAgent(AcmeLoanAgentFramework):
@@ -39,13 +230,15 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
+        user_message = _sanitize_ai_untrusted_text(user_message or "No user message provided.")
+        workflow_summary = _sanitize_ai_untrusted_text(workflow_summary)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        f"User request:\n{user_message or 'No user message provided.'}\n\n"
+                        f"User request:\n{user_message}\n\n"
                         f"Workflow results:\n{workflow_summary}\n\n"
                         "Summarize the file management actions in 2-3 sentences."
                     ),
@@ -135,12 +328,13 @@ class FileManagementAgent(AcmeLoanAgentFramework):
         purge_ok, purge_error = self.purge_records(record_id)
         self.destroy_temp_artifacts(filename)
 
+        content = _sanitize_ai_untrusted_text(content or "")
         workflow_summary = (
             f"Retrieve file id 50: {'ok' if get_ok else get_error}\n"
             f"Delete file '{filename}': {'ok' if delete_ok else delete_error}\n"
             f"Purge records id {record_id}: {'ok' if purge_ok else purge_error}\n"
             f"Destroy temp artifacts for '{filename}': completed\n"
-            f"Content preview: {(content or '')[:80]}"
+            f"Content preview: {content[:80]}"
         )
         model_output = await self.call_agent_model(user_message, workflow_summary)
 
