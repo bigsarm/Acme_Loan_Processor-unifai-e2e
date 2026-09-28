@@ -1,6 +1,11 @@
 """Scheduling Agent class with explicit model invocation."""
 
 import asyncio
+import base64
+import binascii
+import os
+import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -13,7 +18,7 @@ class SchedulingAgent(AcmeLoanAgentFramework):
     AGENT_NAME = "Scheduling Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "amazon nova lite"
-    BEDROCK_MODEL_ID = "amazon.nova-lite-v1:0"
+    BEDROCK_MODEL_ID = os.environ.get("SCHEDULING_AGENT_BEDROCK_MODEL_ID", "")
     DESCRIPTION = "Schedules borrower, underwriting, and support meetings."
     MCP_SERVERS = ["Google Calendar", "Email", "Slack"]
     GUARDRAILS = {
