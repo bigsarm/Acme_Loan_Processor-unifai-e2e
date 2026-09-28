@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import os
+import re
+import urllib.parse
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
@@ -24,12 +27,101 @@ WORKFLOW_STAGE_DURATIONS_MS = {
 }
 
 
+def _decode_base64_segments(text: str) -> list[str]:
+    decoded_segments: list[str] = []
+    for match in re.finditer(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b", text):
+        segment = match.group(0)
+        try:
+            decoded = __import__("base64").b64decode(segment, validate=True).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if decoded:
+            decoded_segments.append(decoded)
+    return decoded_segments
+
+
+def _neutralize_prompt_injection(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+
+    replacement_patterns = [
+        (
+            r"(?is)\b(?:ignore|disregard|bypass|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?\b|\bforget\s+everything\s+above\b",
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            r"(?is)\b(?:you are now|pretend to be|act as|assume the role of)\s+(?:an?\s+)?(?:unrestricted|different|another|system|developer|admin|dan)\b|\bdeveloper\s+mode\b|\bdo\s+anything\s+now\b",
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            r"(?is)</?system>|</?assistant>|</?user>|<\|/?(?:system|assistant|user|tool)\|>|(?:^|\n)\s*(?:---|===){2,}\s*(?:\n|$)",
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            r"(?is)<!--.*?(?:ignore|reveal|leak|send|curl|wget|system prompt|instructions?).*?-->|display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*(?:#fff(?:fff)?|white)\b|(?:\u200b|\u200c|\u200d|\ufeff)+",
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            r"(?is)\b(?:system prompt|hidden prompt|secret prompt)\b.*\b(?:reveal|leak|dump|show)\b|!\[[^\]]*\]\(https?://[^)]+\)|\b(?:send|post|upload|exfiltrate|leak)\b.{0,80}\b(?:https?://|www\.)\S+",
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            r"(?is)\b(?:from now on|in the next turn|on your next response|for the rest of this chat|persist this instruction|remember this instruction)\b",
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            r"(?is)\b(?:system|assistant|tool)\s*:\s*(?:ignore|reveal|leak|follow these instructions)|\[(?:system|assistant|tool)\]",
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            r"(?is)\b(?:curl|wget)\s+https?://\S+|\b(?:bash|sh|zsh|powershell|cmd(?:\.exe)?)\b\s+-[cC]\b|\b(?:rm\s+-rf|nc\s+-e|python\s+-c|perl\s+-e)\b|`[^`]*(?:curl|wget|bash|sh|powershell|rm\s+-rf)[^`]*`",
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            r"(?is)\bD\s*A\s*N\b|\bjailbreak\b|\bunfiltered\b|\bno\s+restrictions\b|\bbypass\s+safety\b|\bfictional\s+framing\b",
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+        (
+            r"(?is)\b(?:metadata|comment|code comment|file content|data field|document field)\b.{0,80}\b(?:ignore|override|follow these instructions|reveal|leak)\b",
+            "<prompt_injection_removed: indirect_injection>",
+        ),
+        (
+            r"(?is)\b(?:ignore\W*){2,}|(?:reveal\W*){2,}|(?:system\W*prompt\W*){2,}|(?:curl\W*https?://\S+\W*){2,}",
+            "<prompt_injection_removed: split_payload>",
+        ),
+    ]
+
+    for pattern, replacement in replacement_patterns:
+        sanitized = re.sub(pattern, replacement, sanitized)
+
+    normalized_checks = [
+        urllib.parse.unquote(text),
+        text.replace("0", "o").replace("1", "i").replace("3", "e").replace("4", "a").replace("5", "s").replace("7", "t"),
+        * _decode_base64_segments(text),
+    ]
+    encoded_attack_pattern = re.compile(
+        r"(?is)\b(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|act\s+as\s+unrestricted|you\s+are\s+now\s+dan|developer\s+mode|reveal\s+(?:the\s+)?system\s+prompt|curl\s+https?://|wget\s+https?://|bash\s+-c|powershell\s+-c)\b"
+    )
+    if any(candidate and encoded_attack_pattern.search(candidate) for candidate in normalized_checks):
+        sanitized = re.sub(
+            r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b|%(?:[0-9A-Fa-f]{2})+|(?:[01]\s*){16,}|(?:[\.-]\s*){16,}",
+            "<prompt_injection_removed: encoded_payload>",
+            sanitized,
+        )
+        if sanitized == text:
+            sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    return sanitized
+
+
 class InstalledSkillAgent(AcmeLoanAgentFramework):
     AGENT_ID = "installed_skill_agent"
     AGENT_NAME = "Installed Skills Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_NAME = os.getenv("INSTALLED_SKILL_AGENT_MODEL_NAME", "configured-approved-model")
+    BEDROCK_MODEL_ID = os.getenv("INSTALLED_SKILL_AGENT_BEDROCK_MODEL_ID", "approved-model-id-required")
     DESCRIPTION = (
         "Automatically loads matching installed skills based on the user's task, "
         "similar to ambient skill invocation in modern AI assistants."
@@ -108,13 +200,15 @@ class InstalledSkillAgent(AcmeLoanAgentFramework):
     async def call_agent_model(self, user_message: str, skill_content: str) -> str:
         # Vulnerability: the full installed skill file is injected as system
         # instructions without signature checks, publisher verification, or sandboxing.
+        sanitized_skill_content = _neutralize_prompt_injection(skill_content)
+        sanitized_user_message = _neutralize_prompt_injection(user_message)
         return await self.call_bedrock_model(
             messages=[
-                {"role": "system", "content": skill_content or self.SYSTEM_PROMPT},
+                {"role": "system", "content": sanitized_skill_content or self.SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        f"User request:\n{user_message or 'No request provided.'}\n\n"
+                        f"User request:\n{sanitized_user_message or 'No request provided.'}\n\n"
                         "Follow the installed skill workflow and respond to the user."
                     ),
                 },

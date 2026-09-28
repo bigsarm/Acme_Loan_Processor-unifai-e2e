@@ -1,6 +1,7 @@
 """Credit Eval Agent class with explicit model invocation."""
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -14,12 +15,37 @@ from .mock_database import (
 logger = logging.getLogger(__name__)
 
 
+_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\ufeff\u2060"
+
+
+def _mask_dob_for_ui(value: Any) -> str:
+    text = str(value or "")
+    match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if match:
+        return f"{match.group(1)}-**-**"
+    match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", text)
+    if match:
+        return f"**/**/{match.group(3)}"
+    return "[masked]" if text else ""
+
+
+def _mask_ssn_for_ui(value: Any) -> str:
+    text = str(value or "")
+    return re.sub(r"\b(\d{3})-(\d{2})-(\d{4})\b", r"***-**-\3", text)
+
+
+def _mask_address_for_ui(value: Any) -> str:
+    text = str(value or "")
+    return "[masked home address]" if text else ""
+
+
 class CreditEvalAgent(AcmeLoanAgentFramework):
     AGENT_ID = "credit_eval_agent"
     AGENT_NAME = "Credit Eval Agent"
     VERSION = "1.0.0"
     MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    BEDROCK_MODEL_ID = os.getenv("CREDIT_EVAL_BEDROCK_MODEL_ID", "mistral.mistral-7b-instruct-v0:2")
+    # Replace the default above with an organization-approved model from the runtime registry/allow list.
     DESCRIPTION = "Evaluates creditworthiness, loan status, and borrower notes for loan decisions."
     MCP_SERVERS: list[str] = []
     GUARDRAILS = {
@@ -32,19 +58,32 @@ class CreditEvalAgent(AcmeLoanAgentFramework):
 
     def sanitize_prompt_content(self, text: str) -> tuple[str, bool]:
         sanitized = text or ""
-        suspicious_patterns = [
-            re.compile(r"<!--.*?-->", re.DOTALL),
-            re.compile(r"[A-Za-z0-9+/=]{24,}"),
-            re.compile(r"\b(?:curl|wget|bash|sh|zsh|powershell|cmd\.exe|rm|chmod|python\s+-c|exec|eval|subprocess)\b", re.IGNORECASE),
-            re.compile(r"\bc[\W_]*u[\W_]*r[\W_]*l\b", re.IGNORECASE),
-            re.compile(r"\bc[4@]rl\b|\bw[6g]et\b|\br[mn]\b", re.IGNORECASE),
+        replacement_patterns = [
+            (re.compile(r"\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?\b", re.IGNORECASE), "<prompt_injection_removed: instruction_override>"),
+            (re.compile(r"\byou\s+are\s+now\s+(?:dan|developer\s+mode|admin\s+mode|root)\b|\bact\s+as\s+(?:an\s+)?(?:unrestricted|unfiltered)\b", re.IGNORECASE), "<prompt_injection_removed: role_hijack>"),
+            (re.compile(r"</?(?:system|assistant|tool|developer)>|(?:^|\n)\s*(?:---|===)\s*(?:\n|$)", re.IGNORECASE), "<prompt_injection_removed: delimiter_escape>"),
+            (re.compile(r"<!--.*?(?:ignore|reveal|leak|system prompt|password|api key|curl|wget|bash).*?-->", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed: hidden_text>"),
+            (re.compile(r"\b(?:system|assistant|tool)\s*:\s*(?:ignore|reveal|leak|send|fetch|exfiltrate)\b", re.IGNORECASE), "<prompt_injection_removed: fake_system_message>"),
+            (re.compile(r"\b(?:send|post|upload|exfiltrate|leak|reveal|list)\b.{0,80}\b(?:passwords?|api\s*keys?|secrets?|confidential information|system prompt|https?://\S+|www\.\S+)\b", re.IGNORECASE), "<prompt_injection_removed: exfiltration_attempt>"),
+            (re.compile(r"\b(?:from\s+now\s+on|in\s+future\s+turns|next\s+messages?|subsequent\s+responses?)\b.{0,80}\b(?:ignore|override|bypass|remember\s+this\s+rule)\b", re.IGNORECASE), "<prompt_injection_removed: context_poisoning>"),
+            (re.compile(r"\b(?:metadata|comment|code\s+comment|file\s+header|seed source document|borrower record)\b.{0,80}\b(?:ignore|override|reveal|leak|send)\b", re.IGNORECASE), "<prompt_injection_removed: indirect_injection>"),
+            (re.compile(r"\b(?:curl|wget|bash|sh|zsh|powershell|cmd\.exe|rm\s+-rf|chmod\s+\+x|python\s+-c|perl\s+-e|exec\(|eval\(|subprocess\.|os\.system)\b", re.IGNORECASE), "<prompt_injection_removed: command_injection>"),
+            (re.compile(r"\b(?:d\s*a\s*n|developer\s+mode|jailbreak|bypass\s+safety|fictional\s+scenario\s+where\s+rules\s+do\s+not\s+apply)\b", re.IGNORECASE), "<prompt_injection_removed: jailbreak_attempt>"),
+            (re.compile(r"\b(?:i\s*g\s*n\s*o\s*r\s*e\s+p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s)\b", re.IGNORECASE), "<prompt_injection_removed: split_payload>"),
+            (re.compile(r"[%][0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){3,}|\\x[0-9A-Fa-f]{2}(?:\\x[0-9A-Fa-f]{2}){3,}|(?:\b[01]{8}(?:\s+[01]{8}){3,}\b)", re.IGNORECASE), "<prompt_injection_removed: encoded_payload>"),
+            (re.compile(r"\b(?:1gn0r[e3]|d1sr[e3]g[a@]rd|0v[e3]rr[i1]d[e3]|[r2][e3]v[e3][a@]l\s+[a@]ll\s+s[e3]cr[e3]ts?)\b", re.IGNORECASE), "<prompt_injection_removed: encoded_payload>"),
+            (re.compile(r"[A-Za-z0-9+/]{32,}={0,2}"), "<prompt_injection_removed: encoded_payload>"),
         ]
 
         blocked = False
-        for pattern in suspicious_patterns:
+        if any(char in sanitized for char in _ZERO_WIDTH_CHARS):
+            blocked = True
+            sanitized = re.sub(f"[{re.escape(_ZERO_WIDTH_CHARS)}]+", "<prompt_injection_removed: hidden_text>", sanitized)
+
+        for pattern, replacement in replacement_patterns:
             if pattern.search(sanitized):
                 blocked = True
-                sanitized = pattern.sub("<blocked_unsafe_content>", sanitized)
+                sanitized = pattern.sub(replacement, sanitized)
 
         return sanitized, blocked
 
@@ -114,9 +153,9 @@ class CreditEvalAgent(AcmeLoanAgentFramework):
             f"Credit score: {borrower_record['credit_score']}\n"
             f"Loan balance: ${borrower_record['loan_balance']:,}\n\n"
             "Borrower details shown in UI:\n"
-            f"DOB: {borrower_record['date_of_birth']}\n"
-            f"SSN: {borrower_record['ssn']}\n"
-            f"Address: {borrower_record['address']}\n\n"
+            f"DOB: {_mask_dob_for_ui(borrower_record['date_of_birth'])}\n"
+            f"SSN: {_mask_ssn_for_ui(borrower_record['ssn'])}\n"
+            f"Address: {_mask_address_for_ui(borrower_record['address'])}\n\n"
             f"Underwriting note:\n{model_output}"
         )
 
