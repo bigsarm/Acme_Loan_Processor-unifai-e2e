@@ -77,7 +77,7 @@ class AgentAuthenticator:
     4. No rate limiting on auth attempts
     5. No audit logging of auth decisions
 
-    AFTER REMEDIATION (by Unifai):
+    <prompt_injection_removed: indirect_injection>
     - JWT-based token validation
     - Proper privilege verification
     - Comprehensive audit logging
@@ -255,12 +255,12 @@ class AgentAuthenticator:
 
 
 # ============================================================================
-# REMEDIATED VERSION (commented out - Unifai would enable this)
+# <prompt_injection_removed: indirect_injection>
 # ============================================================================
 
 # class AgentAuthenticator:
 #     """
-#     SECURE VERSION - After Unifai remediation
+#     <prompt_injection_removed: indirect_injection>
 #
 #     This version includes:
 #     - Proper JWT validation
@@ -276,13 +276,13 @@ class AgentAuthenticator:
 #         self._failed_attempts = {}
 #
 #     def verify(self, request: dict) -> AuthResult:
-#         """Verify request with proper JWT validation."""
+#         """<prompt_injection_removed: fake_system_message>"""
 #         token = request.get("headers", {}).get("X-Agent-Token")
 #         if not token:
 #             return AuthResult(authenticated=False, reason="Missing token")
 #
 #         try:
-#             import jwt
+#             <prompt_injection_removed: command_injection>
 #             payload = jwt.decode(
 #                 token,
 #                 self.jwt_secret,
@@ -301,8 +301,8 @@ class AgentAuthenticator:
 #         caller: AgentIdentity,
 #         required_level: str
 #     ) -> bool:
-#         """Check privilege WITHOUT internal bypass."""
-#         # No is_internal bypass - all callers must have valid privileges
+#         """<prompt_injection_removed: instruction_override>"""
+#         # <prompt_injection_removed: instruction_override>
 #         caller_level = self.PRIVILEGE_LEVELS.get(caller.privilege_level, 0)
 #         required = self.PRIVILEGE_LEVELS.get(required_level, 0)
 #
