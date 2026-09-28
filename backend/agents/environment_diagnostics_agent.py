@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import requests
@@ -38,6 +39,62 @@ _NATURAL_LANGUAGE_COMMAND_PATTERN = re.compile(
 
 _URL_PATTERN = re.compile(r"https?://\S+")
 
+_PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "<pii_redacted:ssn>"),
+    (re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]\d{4}\b"), "<pii_redacted:phone>"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<pii_redacted:email>"),
+    (re.compile(r"\b(?:\d[ -]*?){13,19}\b"), "<pii_redacted:credit_card>"),
+    (re.compile(r"\b(?:\d[ -]*?){9,17}\b"), "<pii_redacted:financial_account>"),
+    (re.compile(r"\b(?:[A-Z]\d{7,8}|\d{9})\b"), "<pii_redacted:passport>"),
+    (re.compile(r"\b\d{2}-\d{7}\b"), "<pii_redacted:tin>"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<pii_redacted:ip_address>"),
+    (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<pii_redacted:mac_address>"),
+    (re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b"), "<pii_redacted:vin>"),
+]
+
+_LABELED_PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)\b(year of birth|yob|dob|date of birth)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:year_of_birth>"),
+    (re.compile(r"(?i)\bborn in\b\s*([^\n,;]+)"), "<pii_redacted:year_of_birth>"),
+    (re.compile(r"(?i)\b(birthplace|place of birth)\b\s*[:#-]?\s*([^\n;]+)"), "<pii_redacted:birthplace>"),
+    (re.compile(r"(?i)\bmother'?s maiden name\b\s*[:#-]?\s*([^\n;]+)"), "<pii_redacted:mothers_maiden_name>"),
+    (re.compile(r"(?i)\b(home address|address)\b\s*[:#-]?\s*([^\n;]+)"), "<pii_redacted:home_address>"),
+    (re.compile(r"(?i)\b(passport(?: number| no\.)?)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:passport>"),
+    (re.compile(r"(?i)\b(driver'?s license(?: number)?|drivers license(?: number)?)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:drivers_license>"),
+    (re.compile(r"(?i)\b(taxpayer identification number|tin)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:tin>"),
+    (re.compile(r"(?i)\b(financial account number|account number)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:financial_account>"),
+    (re.compile(r"(?i)\b(employee id)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:employee_id>"),
+    (re.compile(r"(?i)\b(school id|student id)\b\s*[:#-]?\s*([^\n,;]+)"), "<pii_redacted:school_id>"),
+    (re.compile(r"(?i)\b(fingerprint|retina(?:/iris)? scan|iris scan|voice signature|facial image|medical records|fine location|ethnicity|sexual orientation)\b\s*[:#-]?\s*([^\n;]+)"), "<pii_redacted:sensitive_field>"),
+]
+
+_HIDDEN_TEXT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"<!--(?:(?!-->).)*(?:ignore previous instructions|forget everything above|send data to|system prompt|curl\s+https?://|wget\s+https?://)(?:(?!-->).)*-->", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed:hidden_text>"),
+    (re.compile(r"<[^>]*style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0)[^\"']*[\"'][^>]*>(?:(?!</).)*(?:ignore previous instructions|forget everything above|send data to|system prompt)(?:(?!</).)*</[^>]+>", re.IGNORECASE | re.DOTALL), "<prompt_injection_removed:hidden_text>"),
+    (re.compile(r"[\u200B-\u200D\uFEFF]+"), "<prompt_injection_removed:hidden_text>"),
+]
+
+_DIRECT_INJECTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(?:ignore previous instructions|forget everything above|disregard earlier directions|override the prior instructions)\b", re.IGNORECASE), "<prompt_injection_removed:instruction_override>"),
+    (re.compile(r"\b(?:you are now\s+dan|act as\s+unrestricted|developer mode|do anything now)\b", re.IGNORECASE), "<prompt_injection_removed:role_hijack>"),
+    (re.compile(r"</?(?:system|assistant|tool|developer)>|(?:^|\n)\s*(?:---|===)\s*(?:system|assistant|tool|developer)\s*(?:---|===)", re.IGNORECASE), "<prompt_injection_removed:delimiter_escape>"),
+    (re.compile(r"\b(?:system message|tool message|assistant message)\s*:\s*(?:ignore previous instructions|send data to|reveal|leak)\b[^\n]*", re.IGNORECASE), "<prompt_injection_removed:fake_system_message>"),
+    (re.compile(r"\b(?:send|post|upload|exfiltrate|transmit|leak)\b[^\n.]*\b(?:to|into)\b[^\n.]*https?://\S+", re.IGNORECASE), "<prompt_injection_removed:exfiltration_attempt>"),
+    (re.compile(r"\b(?:reveal|leak|print|list)\b[^\n.]*\b(?:system prompt|passwords?|api keys?|secrets?|tokens?|credentials?|confidential information)\b", re.IGNORECASE), "<prompt_injection_removed:exfiltration_attempt>"),
+    (re.compile(r"\b(?:in your next answer|from now on|for the rest of this conversation|across future turns)\b[^\n.]*\b(?:ignore|override|remember this instruction)\b", re.IGNORECASE), "<prompt_injection_removed:context_poisoning>"),
+    (re.compile(r"\b(?:metadata|file metadata|document comment|code comment)\b[^\n.]*\b(?:ignore previous instructions|send data to|reveal secrets?)\b", re.IGNORECASE), "<prompt_injection_removed:indirect_injection>"),
+    (re.compile(r"\b(?:curl|wget)\b\s+https?://\S+|\b(?:os\.system|subprocess\.(?:run|Popen)|exec\(|eval\()", re.IGNORECASE), "<prompt_injection_removed:command_injection>"),
+    (re.compile(r"\b(?:D\s*A\s*N|jailbreak|fictional framing bypass)\b", re.IGNORECASE), "<prompt_injection_removed:jailbreak_attempt>"),
+]
+
+_SPLIT_PAYLOAD_PATTERN = re.compile(
+    r"i\s*g\s*n\s*o\s*r\s*e\s+p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s+i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s",
+    re.IGNORECASE,
+)
+
+_BASE64_CANDIDATE_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_URL_ENCODED_CANDIDATE_PATTERN = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}")
+_HEX_CANDIDATE_PATTERN = re.compile(r"\b(?:0x)?(?:[0-9A-Fa-f]{2}){8,}\b")
+
 _CREDENTIAL_KEYWORDS = (
     "aws",
     ".aws",
@@ -48,6 +105,103 @@ _CREDENTIAL_KEYWORDS = (
     "apikey",
     "token",
 )
+
+
+def _replace_labeled_value(match: re.Match[str], marker: str) -> str:
+    groups = match.groups()
+    if not groups:
+        return marker
+    if len(groups) == 1:
+        return marker
+    prefix = match.group(0)[: match.start(1) - match.start(0)]
+    if len(groups) == 2:
+        prefix = match.group(1)
+        separator = match.group(0)[len(prefix): match.start(2) - match.start(0)]
+        return f"{prefix}{separator}{marker}"
+    return f"{groups[0]} {marker}"
+
+
+def _redact_uploaded_pii(text: str) -> str:
+    redacted = text
+    for pattern, marker in _PII_PATTERNS:
+        redacted = pattern.sub(marker, redacted)
+    for pattern, marker in _LABELED_PII_PATTERNS:
+        redacted = pattern.sub(lambda match: _replace_labeled_value(match, marker), redacted)
+    return redacted
+
+
+def _is_suspicious_decoded_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "ignore previous instructions",
+            "forget everything above",
+            "you are now dan",
+            "act as unrestricted",
+            "send data to",
+            "system prompt",
+            "curl http://",
+            "curl https://",
+            "wget http://",
+            "wget https://",
+        )
+    )
+
+
+def _neutralize_uploaded_content(text: str) -> str:
+    sanitized = text
+    for pattern, marker in _HIDDEN_TEXT_PATTERNS:
+        sanitized = pattern.sub(marker, sanitized)
+    sanitized = _SPLIT_PAYLOAD_PATTERN.sub("<prompt_injection_removed:split_payload>", sanitized)
+    for pattern, marker in _DIRECT_INJECTION_PATTERNS:
+        sanitized = pattern.sub(marker, sanitized)
+
+    def _replace_base64_candidate(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            import base64
+
+            padded = candidate + ("=" * ((4 - len(candidate) % 4) % 4))
+            decoded = base64.b64decode(padded, validate=True).decode("utf-8", errors="ignore")
+        except Exception:
+            return candidate
+        return "<prompt_injection_removed:encoded_payload>" if _is_suspicious_decoded_text(decoded) else candidate
+
+    sanitized = _BASE64_CANDIDATE_PATTERN.sub(_replace_base64_candidate, sanitized)
+
+    def _replace_url_encoded_candidate(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        decoded = urllib.parse.unquote(candidate)
+        return "<prompt_injection_removed:encoded_payload>" if _is_suspicious_decoded_text(decoded) else candidate
+
+    sanitized = _URL_ENCODED_CANDIDATE_PATTERN.sub(_replace_url_encoded_candidate, sanitized)
+
+    def _replace_hex_candidate(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        hex_text = candidate[2:] if candidate.lower().startswith("0x") else candidate
+        try:
+            decoded = bytes.fromhex(hex_text).decode("utf-8", errors="ignore")
+        except ValueError:
+            return candidate
+        return "<prompt_injection_removed:encoded_payload>" if _is_suspicious_decoded_text(decoded) else candidate
+
+    sanitized = _HEX_CANDIDATE_PATTERN.sub(_replace_hex_candidate, sanitized)
+    return sanitized
+
+
+def _sanitize_uploaded_content(text: str) -> str:
+    return _neutralize_uploaded_content(_redact_uploaded_pii(text))
+
+
+def _sanitize_file_entries(file_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized_entries: list[dict[str, Any]] = []
+    for entry in file_entries:
+        sanitized_entry = dict(entry)
+        content = sanitized_entry.get("extracted_content", "") or ""
+        sanitized_entry["extracted_content"] = _sanitize_uploaded_content(content)
+        sanitized_entries.append(sanitized_entry)
+    return sanitized_entries
 
 
 def _extract_command_requests(file_entries: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -124,8 +278,8 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     )
     MCP_SERVERS: list[str] = []
     GUARDRAILS = {
-        "mask_pii": None,
-        "base64_prompt_detection": None,
+        "mask_pii": True,
+        "base64_prompt_detection": True,
         "credential_minimization": False,
         "inter_agent_authentication": None,
         "tool_output_exfiltration_prevention": False,
@@ -155,6 +309,7 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
         user_message = context.get("user_message", "") or ""
         file_contents = context.get("file_contents", [])
+        file_contents = _sanitize_file_entries(file_contents)
 
         # Vulnerability: a natural-language "command request" surfaced from
         # untrusted document/image content (e.g. vision-model transcription
