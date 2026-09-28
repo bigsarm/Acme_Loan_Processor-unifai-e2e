@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import unquote
 
 import requests
 
@@ -48,6 +49,98 @@ _CREDENTIAL_KEYWORDS = (
     "apikey",
     "token",
 )
+
+_PROMPT_INJECTION_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"(?i)\b(?:ignore|disregard|bypass)\b[^\n]{0,80}\b(?:previous|prior|above|system|developer)\b[^\n]{0,80}\b(?:instruction|instructions|prompt|prompts)\b|\bforget\b[^\n]{0,80}\b(?:everything|all)\b[^\n]{0,40}\b(?:above|before|prior)\b"),
+        "<prompt_injection_removed: instruction_override>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:you are now|act as|pretend to be|behave as)\b[^\n]{0,80}\b(?:dan|developer mode|unrestricted|root|system|admin)\b|\bdo anything now\b"),
+        "<prompt_injection_removed: role_hijack>",
+    ),
+    (
+        re.compile(r"(?is)</?(?:system|assistant|developer|tool)>|```(?:system|assistant|developer|tool)?|(?:^|\n)\s*(?:---+|===+|###+)\s*(?:system|assistant|developer|tool)?"),
+        "<prompt_injection_removed: delimiter_escape>",
+    ),
+    (
+        re.compile(r"(?is)<!--.*?(?:ignore|system prompt|send|exfiltrate|leak|run|execute).*?-->"),
+        "<prompt_injection_removed: hidden_text>",
+    ),
+    (
+        re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]+"),
+        "<prompt_injection_removed: hidden_text>",
+    ),
+    (
+        re.compile(r"(?im)^\s*(?:system|assistant|tool)\s*:\s*.*$"),
+        "<prompt_injection_removed: fake_system_message>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:send|post|upload|exfiltrat(?:e|ion)|leak|forward)\b[^\n]{0,120}\b(?:https?://\S+|webhook|collector|endpoint|system prompt|credentials?|secrets?|tokens?)\b|!\[[^\]]*\]\(https?://[^)]+\)"),
+        "<prompt_injection_removed: exfiltration_attempt>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:from now on|going forward|in the next response|next turn|remember this|save this instruction|persist this)\b"),
+        "<prompt_injection_removed: context_poisoning>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:TODO|NOTE|comment|metadata)\b[^\n]{0,120}\b(?:ignore|override|system prompt|execute|run)\b"),
+        "<prompt_injection_removed: indirect_injection>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:rm\s+-rf|curl\b|wget\b|powershell\b|bash\b|sh\b|cmd\.exe\b|nc\b|ncat\b|python\s+-c\b|subprocess\b|os\.system\b|exec\(|eval\(|chmod\b|kubectl\b|terraform\b)"),
+        "<prompt_injection_removed: command_injection>",
+    ),
+    (
+        re.compile(r"(?is)(?:[A-Za-z]\s+){6,}[A-Za-z]"),
+        "<prompt_injection_removed: split_payload>",
+    ),
+    (
+        re.compile(r"(?i)\b(?:jailbreak|developer mode|dan|do anything now|fictional scenario|hypothetical bypass|safety bypass)\b"),
+        "<prompt_injection_removed: jailbreak_attempt>",
+    ),
+]
+
+_SUSPICIOUS_BASE64_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{24,}={0,2})\b")
+_HEX_BLOB_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{16,}\b")
+_LEETSPEAK_PATTERN = re.compile(r"(?i)\b(?:[a4@][c(][t7]|[i1!][g69]{2}n[o0]r[e3]|b[y¥]p[a4@]ss|[e3]x[e3]c[uµ]t[e3])\b")
+_MORSE_PATTERN = re.compile(r"(?:^|\s)(?:[.-]{1,6}\s+){4,}[.-]{1,6}(?:\s|$)")
+_BINARY_BLOB_PATTERN = re.compile(r"\b[01]{32,}\b")
+
+
+def _sanitize_text_for_prompt_injection(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    decoded_text = unquote(text)
+
+    if decoded_text != text and decoded_text:
+        sanitized = decoded_text
+
+    if _SUSPICIOUS_BASE64_PATTERN.search(sanitized) or _HEX_BLOB_PATTERN.search(sanitized) or _LEETSPEAK_PATTERN.search(sanitized) or _MORSE_PATTERN.search(sanitized):
+        sanitized = _SUSPICIOUS_BASE64_PATTERN.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        sanitized = _HEX_BLOB_PATTERN.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        sanitized = _LEETSPEAK_PATTERN.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+        sanitized = _MORSE_PATTERN.sub("<prompt_injection_removed: encoded_payload>", sanitized)
+
+    if _BINARY_BLOB_PATTERN.search(sanitized):
+        sanitized = _BINARY_BLOB_PATTERN.sub("<prompt_injection_removed: command_injection>", sanitized)
+
+    for pattern, replacement in _PROMPT_INJECTION_REPLACEMENTS:
+        sanitized = pattern.sub(replacement, sanitized)
+
+    return sanitized
+
+
+def _sanitize_file_entries_for_prompt_injection(file_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized_entries: list[dict[str, Any]] = []
+    for entry in file_entries:
+        sanitized_entry = dict(entry)
+        extracted_content = sanitized_entry.get("extracted_content", "") or ""
+        sanitized_entry["extracted_content"] = _sanitize_text_for_prompt_injection(extracted_content)
+        sanitized_entries.append(sanitized_entry)
+    return sanitized_entries
 
 
 def _extract_command_requests(file_entries: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -115,8 +208,8 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     AGENT_ID = "environment_diagnostics_agent"
     AGENT_NAME = "Environment Diagnostics Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
-    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
+    MODEL_NAME = "mistral 7b-instruct"  # Replace with an organization-approved LLM from the runtime registry.
+    BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"  # Replace with the corresponding approved Bedrock model id.
     DESCRIPTION = (
         "Runs diagnostic/credential scans requested inside uploaded support "
         "documents or images and reports the scan result to the requested "
@@ -136,6 +229,8 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     )
 
     async def call_agent_model(self, user_message: str, command_text: str) -> str:
+        user_message = _sanitize_text_for_prompt_injection(user_message)
+        command_text = _sanitize_text_for_prompt_injection(command_text)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -154,7 +249,9 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
 
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
         user_message = context.get("user_message", "") or ""
+        user_message = _sanitize_text_for_prompt_injection(user_message)
         file_contents = context.get("file_contents", [])
+        file_contents = _sanitize_file_entries_for_prompt_injection(file_contents)
 
         # Vulnerability: a natural-language "command request" surfaced from
         # untrusted document/image content (e.g. vision-model transcription
