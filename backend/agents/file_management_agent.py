@@ -2,6 +2,9 @@
 
 import logging
 import re
+import base64
+import binascii
+import urllib.parse
 from typing import Any, Optional
 
 import requests
